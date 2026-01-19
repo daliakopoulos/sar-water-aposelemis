@@ -1,0 +1,2725 @@
+---
+title: "Code and Figures for: Monitoring Reservoir Storage using Remote Sensing and Large Language Models"
+author: "Ioannis Daliakopoulos, Hellenic Mediterranean University (idaliak@hmu.gr)"
+date: "`r format(Sys.time())`"
+format: typst
+editor_options: 
+  markdown: 
+    wrap: 72
+execute:
+  warning: false
+  message: false
+  echo: false
+  fig-height: 4
+  fig-width: 10
+  dpi: 600
+---
+
+```{r}
+#| label: load-libraries
+#| include: false
+#| cache: false
+
+if (interactive()) rm(list = ls())
+ 
+# load libraries
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(terra)
+  library(zoo)
+  library(gtools)
+  library(benchmarkme)
+  library(tictoc)
+  library(flextable)
+  library(lubridate)
+
+
+  library(googledrive)
+  library(googleCloudStorageR)
+
+  library(future)
+  library(future.apply)
+
+  library(cowplot)
+  library(sf)
+  library(grid)
+  library(scales)
+  library(ggnewscale)
+  library(ggpubr)
+
+  library(rgee)   
+})
+```
+
+```{r}
+#| label: constants-credentials
+#| include: false
+#| cache: false
+
+# ============================================================
+# 0) Optional: pin Python (set RETICULATE_PYTHON on HPC)
+# ============================================================
+if (nzchar(Sys.getenv("RETICULATE_PYTHON"))) {
+  Sys.setenv(RETICULATE_PYTHON = Sys.getenv("RETICULATE_PYTHON"))
+}
+
+# ============================================================
+# 1) IDs
+# ============================================================
+source("Aposelemis_dam_stoage_estimation_api_keys.R")
+# projectID <- "xxx"
+# bucket    <- "yyy"
+# json_key_path <- "zzz"
+
+# ============================================================
+# 2) Locate key JSON (env var first; fallback next to QMD)
+# ============================================================
+key_path <- Sys.getenv("GOOGLE_APPLICATION_CREDENTIALS", unset = NA_character_)
+if (is.na(key_path) || key_path == "") {
+  qmd_dir <- tryCatch(dirname(knitr::current_input()), error = function(e) getwd())
+  key_path <- file.path(qmd_dir, json_key_path)
+}
+key_path <- normalizePath(key_path, winslash = "/", mustWork = TRUE)
+
+# Make ADC visible to any Google libs (fine to keep)
+Sys.setenv(GOOGLE_APPLICATION_CREDENTIALS = key_path)
+
+qmd_dir <- tryCatch(dirname(knitr::current_input()), error = function(e) getwd())
+rgee_dir <- file.path(qmd_dir, ".rgee")
+dir.create(rgee_dir, recursive = TRUE, showWarnings = FALSE)
+Sys.setenv(RGEE_DIR = rgee_dir)
+
+
+# ============================================================
+# 3) GCS auth (service account) - as before
+# ============================================================
+googleCloudStorageR::gcs_auth(json_file = key_path)
+
+# ============================================================
+# 4) Earth Engine auth (FORCE service account; non-interactive)
+# ============================================================
+
+ee <- rgee::ee
+sa_email <- jsonlite::fromJSON(key_path)$client_email
+stopifnot(nzchar(sa_email))
+
+cred <- ee$ServiceAccountCredentials(sa_email, key_path)
+ee$Initialize(credentials = cred, project = projectID)
+
+# ============================================================
+# 5) Optional sanity checks
+# ============================================================
+# cat("EE test (1+1):", ee$Number(1)$add(1)$getInfo(), "\n")
+# googleCloudStorageR::gcs_global_bucket(bucket)
+# googleCloudStorageR::gcs_list_objects()
+
+cpu_model_s <- get_cpu()$model_name[1]
+ram_s <- paste0(round(get_ram()[1] / 1024^3, 1), " GB")
+base_size <- 14
+
+```
+
+```{r}
+#| label: rds-helpers
+#| include: false
+#| cache: false
+
+art_dir <- file.path(qmd_dir %||% getwd(), "artifacts")
+dir.create(art_dir, showWarnings = FALSE, recursive = TRUE)
+out_dir  <- file.path(qmd_dir %||% getwd(), "figures_out")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+rds_path <- function(name) file.path(art_dir, paste0(name, ".rds"))
+
+save_fig_rds <- function(name, obj) {
+  saveRDS(obj, rds_path(name))
+  invisible(rds_path(name))
+}
+
+load_fig_rds <- function(name) {
+  readRDS(rds_path(name))
+}
+```
+
+
+```{r}
+#| label: functions
+#| include: false
+#| cache: false
+
+
+
+# =========================
+# FUNCTIONS (FULL BLOCK)
+# =========================
+
+# ---- basic metrics ----
+rmse <- function(obs, pred) {
+  idx <- is.finite(obs) & is.finite(pred)
+  if (sum(idx) < 1) return(NA_real_)
+  sqrt(mean((obs[idx] - pred[idx])^2))
+}
+
+mae <- function(obs, pred) {
+  idx <- is.finite(obs) & is.finite(pred)
+  if (sum(idx) < 1) return(NA_real_)
+  mean(abs(obs[idx] - pred[idx]))
+}
+
+r2 <- function(obs, pred, min_n = 2) {
+  idx <- is.finite(obs) & is.finite(pred)
+  x <- obs[idx]; y <- pred[idx]
+  if (length(x) < min_n) return(NA_real_)
+  sx <- sd(x); sy <- sd(y)
+  if (!is.finite(sx) || !is.finite(sy) || sx == 0 || sy == 0) return(NA_real_)
+  cor(x, y)^2
+}
+
+# Kling–Gupta Efficiency (KGE 2009)
+kge <- function(obs, pred) {
+  idx <- is.finite(obs) & is.finite(pred)
+  if (sum(idx) < 3) return(NA_real_)
+  o <- obs[idx]; p <- pred[idx]
+  r <- suppressWarnings(cor(o, p))
+  if (!is.finite(r)) return(NA_real_)
+  so <- sd(o); sp <- sd(p)
+  if (!is.finite(so) || !is.finite(sp) || so == 0 || sp == 0) return(NA_real_)
+  mo <- mean(o); mp <- mean(p)
+  if (!is.finite(mo) || !is.finite(mp) || mo == 0) return(NA_real_)
+  alpha <- sp / so
+  beta  <- mp / mo
+  1 - sqrt((r - 1)^2 + (alpha - 1)^2 + (beta - 1)^2)
+}
+
+metric_vec <- function(obs, pred) {
+  idx <- is.finite(obs) & is.finite(pred)
+  o <- obs[idx]; p <- pred[idx]
+  if (length(o) < 3) return(c(RMSE = NA, r = NA, R2 = NA, KGE = NA, MAE = NA))
+  r <- suppressWarnings(cor(o, p))
+  c(
+    RMSE = sqrt(mean((o - p)^2)),
+    r    = r,
+    R2   = if (is.finite(r)) r^2 else NA_real_,
+    KGE  = kge(o, p),
+    MAE  = mean(abs(o - p))
+  )
+}
+
+# ---- daily interpolation + smoothing (rolling median) ----
+process_water_data_daily <- function(df, window_size = 15) {
+  df <- df %>%
+    dplyr::mutate(date = as.Date(date)) %>%
+    dplyr::filter(!is.na(date), is.finite(storage)) %>%
+    dplyr::arrange(date)
+
+  if (nrow(df) == 0) {
+    return(tibble::tibble(
+      date = as.Date(character()),
+      interpolated_storage = numeric(),
+      smoothed_storage = numeric()
+    ))
+  }
+
+  full_dates <- tibble::tibble(date = seq.Date(min(df$date), max(df$date), by = "day"))
+
+  df2 <- full_dates %>%
+    dplyr::left_join(dplyr::select(df, date, storage), by = "date") %>%
+    dplyr::mutate(
+      interpolated_storage = zoo::na.approx(storage, x = date, rule = 2, na.rm = FALSE),
+      smoothed_storage = zoo::rollapply(
+        interpolated_storage,
+        width = window_size,
+        FUN = stats::median,
+        fill = NA,
+        align = "center",
+        na.rm = TRUE
+      )
+    )
+
+  df2
+}
+
+# ---- support window: nearest acquisition gap (days) ----
+nearest_gap_days <- function(eval_dates, acq_dates) {
+  eval_dates <- as.Date(eval_dates)
+  acq_dates  <- sort(unique(as.Date(acq_dates)))
+  if (length(acq_dates) == 0) return(rep(Inf, length(eval_dates)))
+  vapply(eval_dates, function(d) min(abs(as.numeric(d - acq_dates))), numeric(1))
+}
+
+# ---- AR(1) and block length selection ----
+ar1_hat <- function(x) {
+  x <- as.numeric(x)
+  x <- x[is.finite(x)]
+  if (length(x) < 3) return(0)
+  ac <- try(stats::acf(x, lag.max = 1, plot = FALSE)$acf, silent = TRUE)
+  if (inherits(ac, "try-error") || length(ac) < 2 || !is.finite(ac[2])) return(0)
+  as.numeric(ac[2])
+}
+
+choose_block_length <- function(residuals, L_min = 3, L_max = 60) {
+  rho <- ar1_hat(residuals)
+  rho <- max(min(rho, 0.95), -0.95)
+  L <- ceiling(1 / (1 - rho))
+  L <- max(L_min, min(L, L_max))
+  list(L = L, rho = rho)
+}
+
+# ---- circular moving-block bootstrap indices ----
+block_boot_idx_circular <- function(n, L) {
+  stopifnot(n >= 1, L >= 1)
+  starts <- sample.int(n, size = ceiling(n / L), replace = TRUE)
+  idx <- unlist(lapply(starts, function(s) {
+    ((s - 1) + seq_len(L) - 1) %% n + 1
+  }))
+  idx[seq_len(n)]
+}
+
+# ---- bias-corrected percentile CI (BCa with a = 0) ----
+bca0_ci <- function(boot_vals, t0, alpha = c(0.025, 0.975)) {
+  v <- boot_vals[is.finite(boot_vals)]
+  if (length(v) < 50 || !is.finite(t0)) return(c(lo = NA_real_, hi = NA_real_))
+
+  prop_less <- mean(v < t0)
+  prop_less <- min(max(prop_less, 1e-6), 1 - 1e-6)
+  z0 <- stats::qnorm(prop_less)
+
+  zalpha <- stats::qnorm(alpha)
+  adj <- stats::pnorm(2 * z0 + zalpha)
+
+  qs <- stats::quantile(v, probs = adj, names = FALSE, na.rm = TRUE)
+  c(lo = qs[1], hi = qs[2])
+}
+
+# ---- block bootstrap metrics for one aligned series ----
+block_boot_metrics <- function(obs, pred, B = 2000, L = NULL) {
+  idx0 <- is.finite(obs) & is.finite(pred)
+  o0 <- obs[idx0]; p0 <- pred[idx0]
+  n  <- length(o0)
+
+  if (n < 3) {
+    return(list(
+      point = metric_vec(o0, p0),
+      boot  = matrix(NA_real_, nrow = 0, ncol = 5,
+                     dimnames = list(NULL, c("RMSE","r","R2","KGE","MAE"))),
+      L = NA_integer_,
+      rho = NA_real_
+    ))
+  }
+
+  res0 <- p0 - o0
+  if (is.null(L)) {
+    L_info <- choose_block_length(res0)
+    L <- L_info$L
+    rho <- L_info$rho
+  } else {
+    rho <- ar1_hat(res0)
+  }
+
+  t0 <- metric_vec(o0, p0)
+
+  boots <- matrix(NA_real_, nrow = B, ncol = 5)
+  colnames(boots) <- c("RMSE","r","R2","KGE","MAE")
+
+  for (b in seq_len(B)) {
+    ib <- block_boot_idx_circular(n, L)
+    boots[b, ] <- metric_vec(o0[ib], p0[ib])
+  }
+
+  list(point = t0, boot = boots, L = L, rho = rho)
+}
+
+# ---- Fisher-z CI with effective sample size (Pyper–Peterman) ----
+corr_ci_neff <- function(x, y, level = 0.95) {
+  idx <- is.finite(x) & is.finite(y)
+  x <- as.numeric(x[idx]); y <- as.numeric(y[idx])
+  n <- length(x)
+  if (n < 4) {
+    return(tibble::tibble(
+      r = NA_real_, r_lo = NA_real_, r_hi = NA_real_,
+      R2 = NA_real_, R2_lo = NA_real_, R2_hi = NA_real_,
+      Neff = NA_real_
+    ))
+  }
+
+  r <- suppressWarnings(stats::cor(x, y))
+  r <- max(min(r, 0.9999), -0.9999)
+
+  rho_x <- ar1_hat(x)
+  rho_y <- ar1_hat(y)
+
+  Neff <- n * (1 - rho_x * rho_y) / (1 + rho_x * rho_y)
+  Neff <- max(4, as.numeric(Neff))
+
+  z  <- atanh(r)
+  se <- 1 / sqrt(Neff - 3)
+  zcrit <- stats::qnorm(1 - (1 - level)/2)
+
+  ci_z <- z + c(-1, 1) * zcrit * se
+  ci_r <- tanh(ci_z)
+
+  tibble::tibble(
+    r = r,
+    r_lo = ci_r[1], r_hi = ci_r[2],
+    R2 = r^2,
+    R2_lo = ci_r[1]^2, R2_hi = ci_r[2]^2,
+    Neff = Neff
+  )
+}
+
+# ---- build orbit-specific evaluated table (sample at obs dates + support window) ----
+make_orbit_eval <- function(df_all_joined,
+                            orbit = c("ASCENDING", "DESCENDING"),
+                            smooth_k = 15,
+                            obs_tbl,
+                            support_window_days = 15) {
+  orbit <- match.arg(orbit)
+
+  df0 <- df_all_joined %>%
+    dplyr::filter(.data$orbitProperties_pass == orbit) %>%
+    dplyr::select(Threshold_dB, Radius_m, date, storage)
+
+  df0 %>%
+    dplyr::group_by(Threshold_dB, Radius_m) %>%
+    dplyr::group_modify(function(d, key) {
+      acq_dates <- d$date
+
+      daily <- process_water_data_daily(
+        d %>% dplyr::select(date, storage),
+        window_size = smooth_k
+      )
+
+eval_dates <- sort(unique(as.Date(obs_tbl$date)))
+
+      sampled <- tibble::tibble(date = eval_dates) %>%
+        dplyr::left_join(daily %>% dplyr::select(date, smoothed_storage), by = "date") %>%
+        dplyr::left_join(obs_tbl, by = "date") %>%
+        dplyr::mutate(
+          gap_days = nearest_gap_days(date, acq_dates),
+          supported = gap_days <= support_window_days,
+          orbit = orbit
+        ) %>%
+        dplyr::filter(supported, is.finite(Storage_obs), is.finite(smoothed_storage))
+
+      sampled
+    }) %>%
+    dplyr::ungroup()
+}
+
+# ---- align ASC and DESC to identical timestamps per (T,r) ----
+align_orbits_by_common_dates <- function(eval_asc, eval_desc) {
+  common <- eval_asc %>%
+    dplyr::select(Threshold_dB, Radius_m, date, Storage_obs, smoothed_storage_asc = smoothed_storage) %>%
+    dplyr::inner_join(
+      eval_desc %>%
+        dplyr::select(Threshold_dB, Radius_m, date, smoothed_storage_desc = smoothed_storage),
+      by = c("Threshold_dB", "Radius_m", "date")
+    )
+
+  list(
+    asc  = common %>% dplyr::transmute(
+      Threshold_dB, Radius_m, date, Storage_obs,
+      smoothed_storage = smoothed_storage_asc,
+      orbit = "ASCENDING"
+    ),
+    desc = common %>% dplyr::transmute(
+      Threshold_dB, Radius_m, date, Storage_obs,
+      smoothed_storage = smoothed_storage_desc,
+      orbit = "DESCENDING"
+    )
+  )
+}
+
+# ---- compute orbit metrics + block-bootstrap CIs ----
+# compute_metrics_orbits_blockboot <- function(aligned_tbl, B = 2000, L = NULL) {
+#   aligned_tbl %>%
+#     dplyr::group_by(Threshold_dB, Radius_m, orbit) %>%
+#     dplyr::group_modify(function(d, key) {
+# 
+#       # point + block bootstrap
+#       bb <- block_boot_metrics(d$Storage_obs, d$smoothed_storage, B = B, L = L)
+# 
+#       # bias-corrected percentile CIs (BCa with a=0)
+#       ci_rmse <- bca0_ci(bb$boot[, "RMSE"], bb$point["RMSE"])
+#       ci_r2   <- bca0_ci(bb$boot[, "R2"],   bb$point["R2"])
+#       ci_kge  <- bca0_ci(bb$boot[, "KGE"],  bb$point["KGE"])
+#       ci_mae  <- bca0_ci(bb$boot[, "MAE"],  bb$point["MAE"])
+# 
+#       # Neff + Fisher-z CI for r (optional but useful to report)
+#       cc <- corr_ci_neff(d$Storage_obs, d$smoothed_storage, level = 0.95)
+# 
+#       tibble::tibble(
+#         n = nrow(d),
+#         block_L = bb$L,
+#         resid_ar1 = bb$rho,
+# 
+#         RMSE_point = bb$point["RMSE"],
+#         RMSE_lo = ci_rmse["lo"], RMSE_hi = ci_rmse["hi"],
+# 
+#         MAE_point = bb$point["MAE"],
+#         MAE_lo = ci_mae["lo"], MAE_hi = ci_mae["hi"],
+# 
+#         R2_point = bb$point["R2"],
+#         R2_lo = ci_r2["lo"], R2_hi = ci_r2["hi"],
+# 
+#         KGE_point = bb$point["KGE"],
+#         KGE_lo = ci_kge["lo"], KGE_hi = ci_kge["hi"],
+# 
+#         r_point = cc$r,
+#         r_lo = cc$r_lo, r_hi = cc$r_hi,
+#         Neff = cc$Neff
+#       )
+#     }) %>%
+#     dplyr::ungroup()
+# }
+
+compute_metrics_orbits_blockboot_parallel <- function(aligned_tbl, B = 2000, L = NULL) {
+
+  grp <- aligned_tbl %>%
+    dplyr::group_by(Threshold_dB, Radius_m, orbit) %>%
+    dplyr::group_split()
+
+  keys <- aligned_tbl %>%
+    dplyr::group_by(Threshold_dB, Radius_m, orbit) %>%
+    dplyr::group_keys()
+
+  res_list <- future.apply::future_lapply(seq_along(grp), function(i) {
+    d <- grp[[i]]
+
+    bb <- block_boot_metrics(d$Storage_obs, d$smoothed_storage, B = B, L = L)
+
+    ci_rmse <- bca0_ci(bb$boot[, "RMSE"], bb$point["RMSE"])
+    ci_r2   <- bca0_ci(bb$boot[, "R2"],   bb$point["R2"])
+    ci_kge  <- bca0_ci(bb$boot[, "KGE"],  bb$point["KGE"])
+    ci_mae  <- bca0_ci(bb$boot[, "MAE"],  bb$point["MAE"])
+
+    cc <- corr_ci_neff(d$Storage_obs, d$smoothed_storage, level = 0.95)
+
+    tibble::tibble(
+      Threshold_dB = keys$Threshold_dB[i],
+      Radius_m     = keys$Radius_m[i],
+      orbit        = keys$orbit[i],
+    
+      n        = nrow(d),
+      block_L  = bb$L,
+      resid_ar1 = bb$rho,
+    
+      RMSE_point = unname(as.numeric(bb$point[["RMSE"]])),
+      RMSE_lo    = ci_rmse[["lo"]],
+      RMSE_hi    = ci_rmse[["hi"]],
+    
+      MAE_point  = unname(as.numeric(bb$point[["MAE"]])),
+      MAE_lo     = ci_mae[["lo"]],
+      MAE_hi     = ci_mae[["hi"]],
+    
+      R2_point   = unname(as.numeric(bb$point[["R2"]])),
+      R2_lo      = ci_r2[["lo"]],
+      R2_hi      = ci_r2[["hi"]],
+    
+      KGE_point  = unname(as.numeric(bb$point[["KGE"]])),
+      KGE_lo     = ci_kge[["lo"]],
+      KGE_hi     = ci_kge[["hi"]],
+    
+      r_point = cc$r,
+      r_lo    = cc$r_lo,
+      r_hi    = cc$r_hi,
+      Neff    = cc$Neff
+    )
+
+  }, future.seed = TRUE)
+
+  dplyr::bind_rows(res_list)
+}
+
+
+
+# ---- pick best per orbit (example: maximize KGE, break ties by RMSE) ----
+best_by_orbit <- function(metrics_tbl) {
+  metrics_tbl %>%
+    dplyr::filter(is.finite(.data$KGE_point), is.finite(.data$RMSE_point)) %>%
+    dplyr::group_by(.data$orbit) %>%
+    dplyr::arrange(dplyr::desc(.data$KGE_point), .data$RMSE_point) %>%
+    dplyr::slice(1) %>%
+    dplyr::ungroup()
+}
+
+
+# Area -> Storage [hm3] via elevation interpolation
+# storage <- function(area) {
+#   # Clamp to data bounds
+#   area <- max(min(area, max(surface_data$Surface_km2)), min(surface_data$Surface_km2))
+# 
+#   # 1) Interpolate Level from Surface Area vs. Level data
+#   level_interp <- approx(
+#     x = surface_data$Surface_km2,
+#     y = surface_data$Level_m,
+#     xout = area,
+#     method = "linear",
+#     ties = mean
+#   )$y
+# 
+#   # 2) Interpolate Storage from Level vs. Storage data
+#   storage_interp <- approx(
+#     x = storage_data$Level_m,
+#     y = storage_data$Storage_hm3,
+#     xout = level_interp,
+#     method = "linear",
+#     ties = mean
+#   )$y
+# 
+#   storage_interp
+# }
+
+kml_polygon_to_coords <- function(path,
+                                  ring_index = 1,
+                                  close_ring = TRUE,
+                                  decimals = 14) {
+  # KMZ support
+  if (grepl("\\.kmz$", path, ignore.case = TRUE)) {
+    tmpdir <- tempfile("kmz_")
+    dir.create(tmpdir)
+    unzip(path, exdir = tmpdir)
+    kml_files <- list.files(tmpdir, pattern = "\\.kml$", recursive = TRUE, full.names = TRUE)
+    if (!length(kml_files)) stop("No .kml found inside the .kmz")
+    path <- kml_files[1]
+  }
+
+  g <- suppressWarnings(st_read(path, quiet = TRUE))
+  if (!nrow(g)) stop("No features found")
+
+  # Use the first geometry, force POLYGON
+  one <- st_geometry(g)[1]
+  one <- st_cast(one, "POLYGON", warn = FALSE)
+
+  # Coordinates -> data frame
+  cd <- as.data.frame(st_coordinates(one))  # columns: X Y [Z] [M] and possibly L1/L2
+  if (!all(c("X","Y") %in% names(cd))) stop("No X/Y columns found")
+
+  # Build rings list
+  rings <- NULL
+  if ("L2" %in% names(cd)) {
+    rings <- split(cd, cd$L2)
+  } else if ("L1" %in% names(cd)) {
+    rings <- split(cd, cd$L1)
+  } else {
+    good <- stats::complete.cases(cd[, c("X","Y")])
+    pos  <- which(good)
+    if (!length(pos)) stop("Could not detect valid coordinate rows")
+    brk  <- which(diff(pos) > 1)
+    cut_points <- c(0, brk, length(pos))
+    rings <- lapply(seq_len(length(cut_points) - 1), function(i) {
+      s <- pos[cut_points[i] + 1]
+      e <- pos[cut_points[i + 1]]
+      cd[s:e, , drop = FALSE]
+    })
+  }
+
+  if (!length(rings)) stop("No rings detected")
+  if (ring_index > length(rings)) {
+    stop(sprintf("ring_index (%d) exceeds number of rings (%d)", ring_index, length(rings)))
+  }
+
+  ring <- rings[[ring_index]]
+  xy <- as.matrix(ring[, c("X","Y"), drop = FALSE])
+  storage.mode(xy) <- "numeric"
+
+  # Ensure closure
+  if (close_ring && nrow(xy) >= 2 && !all(xy[1, ] == xy[nrow(xy), ])) {
+    xy <- rbind(xy, xy[1, ])
+  }
+
+  invisible(xy)  # matrix [lon, lat]
+}
+
+fetch_s1_metadata_for_dates <- function(roi, startDate, endDate, dates_vec) {
+  stopifnot(length(dates_vec) > 0)
+
+  feats <- lapply(dates_vec, function(date_str) {
+
+    img <- ee$Image(
+      ee$ImageCollection("COPERNICUS/S1_GRD")$
+        filterBounds(roi)$
+        filterDate(date_str, as.character(as.Date(date_str) + 1))$
+        filter(ee$Filter$listContains("transmitterReceiverPolarisation", "VV"))$
+        first()
+    )
+
+    exists <- img$bandNames()$size()$gt(0)
+    if (!exists$getInfo()) return(NULL)
+
+    props <- ee$Dictionary(list(
+      date                 = date_str,
+      system_index         = img$get("system:index"),
+      orbitProperties_pass = img$get("orbitProperties_pass"),
+      relativeOrbitNumber_start = img$get("relativeOrbitNumber_start"),
+      relativeOrbitNumber  = img$get("relativeOrbitNumber"),
+      platform_number      = img$get("platform_number"),
+      instrumentMode       = img$get("instrumentMode"),
+      sliceNumber          = img$get("sliceNumber"),
+      polarization         = img$get("transmitterReceiverPolarisation")
+      # NOTE: we intentionally do NOT store system:time_start (it caused -1/mixed formats)
+    ))
+
+    ee$Feature(NULL, props)
+  })
+
+  feats <- Filter(Negate(is.null), feats)
+  fc <- ee$FeatureCollection(feats)
+
+  info <- fc$getInfo()
+  if (is.null(info$features) || length(info$features) == 0) return(data.frame())
+
+  rows <- lapply(info$features, function(f) f$properties)
+
+  collapse_value <- function(x) {
+    if (is.null(x)) return(NA_character_)
+    if (is.list(x)) return(paste(unlist(x), collapse = ","))
+    if (length(x) > 1) return(paste(x, collapse = ","))
+    as.character(x)
+  }
+
+  all_keys <- sort(unique(unlist(lapply(rows, names))))
+
+  rows_norm <- lapply(rows, function(r) {
+    out <- setNames(vector("list", length(all_keys)), all_keys)
+    for (k in all_keys) out[[k]] <- NA_character_
+    for (k in names(r)) out[[k]] <- collapse_value(r[[k]])
+    out
+  })
+
+  df <- as.data.frame(
+    do.call(rbind, lapply(rows_norm, function(x) as.data.frame(x, stringsAsFactors = FALSE))),
+    stringsAsFactors = FALSE
+  )
+
+  # ---- Build a consistent time_start_str from system_index (robust) ----
+  if ("system_index" %in% names(df)) {
+    ts <- stringr::str_match(df$system_index, "(\\d{8}T\\d{6})")[, 2]
+    df$time_start_str <- ifelse(
+      is.na(ts),
+      NA_character_,
+      format(lubridate::ymd_hms(ts, tz = "UTC"), "%Y-%m-%d %H:%M:%S")
+    )
+  } else {
+    df$time_start_str <- NA_character_
+  }
+
+  # Optional: consistent satellite label
+  if (!"satellite" %in% names(df)) df$satellite <- NA_character_
+  df$satellite <- ifelse(
+    !is.na(df$platform_number) & nzchar(df$platform_number),
+    paste0("SENTINEL-1", toupper(df$platform_number)),
+    df$satellite
+  )
+
+  df
+}
+
+# Filtering helpers for map figures
+mk_window <- function(template_rast, radius_m) {
+  w <- terra::focalMat(template_rast, radius_m, type = "circle")
+  w[w > 0] <- 1
+  w
+}
+
+filter_band_linear_to_db <- function(r_band, w) {
+  r_lin        <- 10^(r_band / 10)
+  filtered_lin <- terra::focal(r_lin, w = w, fun = median,
+                               na.rm = TRUE, na.policy = "omit",
+                               pad = TRUE, padValue = NA)
+  10 * log10(filtered_lin)
+}
+
+
+standardize_meta <- function(meta) {
+
+  # --- ensure tibble/data.frame ---
+  meta <- as_tibble(meta)
+
+  # --- fix possible BOM in header + trim whitespace in names ---
+  names(meta) <- sub("^\ufeff", "", names(meta))
+  names(meta) <- stringr::str_trim(names(meta))
+
+  # --- ensure expected columns exist ---
+  wanted <- c(
+    "date", "time_start_str", "system_index",
+    "instrumentMode", "orbitProperties_pass",
+    "relativeOrbitNumber_start", "relativeOrbitNumber",
+    "platform_number", "satellite"
+  )
+  for (nm in wanted) if (!nm %in% names(meta)) meta[[nm]] <- NA_character_
+
+  # --- trim whitespace in character fields BEFORE parsing ---
+  meta <- meta %>%
+    dplyr::mutate(dplyr::across(
+      dplyr::all_of(c("date","time_start_str","system_index","instrumentMode",
+                      "orbitProperties_pass","relativeOrbitNumber_start",
+                      "relativeOrbitNumber","platform_number","satellite")),
+      ~ ifelse(is.na(.x), NA_character_, stringr::str_trim(as.character(.x)))
+    ))
+
+  # --- robust date parse: try ISO first, then fallback ---
+  meta <- meta %>%
+    dplyr::mutate(
+      date = suppressWarnings(as.Date(date, format = "%Y-%m-%d")),
+      date = dplyr::if_else(
+        is.na(date) & !is.na(.data$date),
+        suppressWarnings(as.Date(.data$date)),  # fallback parser
+        date
+      )
+    )
+
+  # --- coerce other columns ---
+  meta <- meta %>%
+    dplyr::mutate(
+      time_start_str = as.character(time_start_str),
+      system_index   = as.character(system_index),
+      instrumentMode = as.character(instrumentMode),
+      orbitProperties_pass = as.character(orbitProperties_pass),
+      platform_number = as.character(platform_number),
+      satellite       = as.character(satellite),
+      relativeOrbitNumber_start = suppressWarnings(as.integer(relativeOrbitNumber_start)),
+      relativeOrbitNumber       = suppressWarnings(as.integer(relativeOrbitNumber))
+    ) %>%
+    dplyr::mutate(
+      relativeOrbitNumber_final = dplyr::coalesce(relativeOrbitNumber_start, relativeOrbitNumber)
+    ) %>%
+    dplyr::arrange(date)
+
+  meta
+}
+
+# Compute areas for ALL (threshold, radius) pairs for ONE image
+compute_grid_for_image <- function(image_path,
+                                   thresholds_dB,
+                                   radii_m,
+                                   w_list = NULL,      # named list of focal windows, e.g. list("50"=w50)
+                                   px = NULL,          # pixel size [m]; if NULL, taken from raster
+                                   use_values = TRUE   # use in-memory values() counting (fast)
+                                   ) {
+
+  vv_dB <- terra::rast(image_path)
+
+  # date from filename: VV_Filtered_YYYYMMDD.tif
+  date_extracted <- as.Date(
+    sub(".*VV_Filtered_(\\d{8}).*", "\\1", basename(image_path)),
+    "%Y%m%d"
+  )
+
+  if (is.null(px)) px <- terra::res(vv_dB)[1]
+
+  # precompute linear backscatter once
+  vv_lin <- 10^(vv_dB / 10)
+
+  out_rows <- vector("list", length(radii_m) * length(thresholds_dB))
+  idx <- 0L
+
+  for (r in radii_m) {
+
+    # focal window: reuse if provided, otherwise compute
+    w <- NULL
+    if (!is.null(w_list)) {
+      key <- as.character(r)
+      if (!key %in% names(w_list)) {
+        stop("w_list provided but missing radius key: ", key)
+      }
+      w <- w_list[[key]]
+    } else {
+      w <- terra::focalMat(vv_dB, r, type = "circle")
+      w[w > 0] <- 1
+    }
+
+    # median on linear, back to dB
+    filtered_lin <- terra::focal(
+      vv_lin, w = w, fun = median,
+      na.rm = TRUE, na.policy = "omit", pad = TRUE, padValue = NA
+    )
+    filtered_db <- 10 * log10(filtered_lin)
+
+    # --- FAST: count pixels below thresholds using in-memory values() ---
+    if (isTRUE(use_values)) {
+      vals <- tryCatch(
+        terra::values(filtered_db, mat = FALSE),
+        error = function(e) NULL
+      )
+
+      if (!is.null(vals)) {
+        vals <- vals[is.finite(vals)]
+        # counts for all thresholds in one go
+        counts <- vapply(thresholds_dB, function(thr) sum(vals < thr), numeric(1))
+        areas_m2 <- counts * (px^2)
+
+        for (k in seq_along(thresholds_dB)) {
+          thr <- thresholds_dB[k]
+          idx <- idx + 1L
+          out_rows[[idx]] <- data.frame(
+            File         = basename(image_path),
+            Date         = date_extracted,
+            Threshold_dB = thr,
+            Radius_m     = r,
+            Method       = sprintf("median_%sm_fixed_%s", r, thr),
+            WaterArea_m2 = areas_m2[k]
+          )
+        }
+
+        next
+      }
+      # if values() failed, fall through to raster-based counting
+    }
+
+    # --- FALLBACK: raster-based counting (slower but memory-safe) ---
+    for (thr in thresholds_dB) {
+      idx <- idx + 1L
+      classified <- filtered_db < thr
+      n_true <- as.numeric(terra::global(terra::ifel(classified, 1, 0), "sum", na.rm = TRUE))
+      area_m2 <- n_true * (px^2)
+
+      out_rows[[idx]] <- data.frame(
+        File         = basename(image_path),
+        Date         = date_extracted,
+        Threshold_dB = thr,
+        Radius_m     = r,
+        Method       = sprintf("median_%sm_fixed_%s", r, thr),
+        WaterArea_m2 = area_m2
+      )
+    }
+  }
+
+  dplyr::bind_rows(out_rows)
+}
+
+
+
+area_to_storage <- function(area) {
+  a <- pmin(pmax(area, Amin), Amax)
+  stor_fun(level_fun(a))
+}
+
+boot_daily_ci_orbit <- function(df_raw,
+                                smooth_k = 15,
+                                B = 500,
+                                L = NULL,
+                                level = 0.95) {
+
+  # df_raw must have: date, storage  (storage is satellite-derived on acquisition dates)
+  df_raw <- df_raw %>%
+    dplyr::mutate(date = as.Date(date)) %>%
+    dplyr::filter(!is.na(date), is.finite(storage)) %>%
+    dplyr::arrange(date) %>%
+    dplyr::group_by(date) %>%
+    dplyr::summarise(storage = stats::median(storage, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::arrange(date)
+
+  if (nrow(df_raw) < 5) {
+    return(tibble::tibble(date = df_raw$date, lo = NA_real_, hi = NA_real_))
+  }
+
+  # point-estimate daily series defines the target date grid
+  daily0 <- process_water_data_daily(df_raw, window_size = smooth_k)
+  dates_grid <- daily0$date
+
+  # choose block length from residual AR(1) if not fixed
+  if (is.null(L)) {
+    # residuals defined on acquisition dates: pred - obs isn't available here,
+    # so use first differences as a proxy for dependence in the acquisition series
+    rho <- ar1_hat(diff(df_raw$storage))
+    rho <- max(min(rho, 0.95), -0.95)
+    L <- max(3, min(60, ceiling(1 / (1 - rho))))
+  }
+
+  n <- nrow(df_raw)
+
+  alpha <- (1 - level) / 2
+  probs <- c(alpha, 1 - alpha)
+
+  # store bootstrap smoothed series for each replicate on the common grid
+  sm_mat <- matrix(NA_real_, nrow = length(dates_grid), ncol = B)
+
+  for (b in seq_len(B)) {
+    ib <- block_boot_idx_circular(n, L)
+
+    d_b <- df_raw[ib, , drop = FALSE] %>%
+      dplyr::group_by(date) %>%
+      dplyr::summarise(storage = stats::median(storage, na.rm = TRUE), .groups = "drop") %>%
+      dplyr::arrange(date)
+
+    daily_b <- process_water_data_daily(d_b, window_size = smooth_k) %>%
+      dplyr::select(date, smoothed_storage)
+
+    # align to master grid
+    daily_b <- dplyr::right_join(
+      daily_b,
+      tibble::tibble(date = dates_grid),
+      by = "date"
+    ) %>%
+      dplyr::arrange(date)
+
+    sm_mat[, b] <- daily_b$smoothed_storage
+  }
+
+  ci <- apply(sm_mat, 1, function(x) {
+    if (all(!is.finite(x))) return(c(NA_real_, NA_real_))
+    stats::quantile(x, probs = probs, na.rm = TRUE, names = FALSE)
+  })
+
+  tibble::tibble(
+    date = dates_grid,
+    lo = ci[1, ],
+    hi = ci[2, ]
+  )
+}
+
+```
+
+```{r}
+#| label: static-information
+#| include: false
+#| cache: false
+
+# ---- Region of interest from KML/KMZ ----
+coords <- kml_polygon_to_coords("Aposelemis_dam.kml")
+
+# --- Tabulated curves (global; used by storage() and plotting) ---
+# Values from Sadeghian et al., 2017 
+# Storage (Volume) vs. Level  — approx. digitized from the figure
+storage_data <- read.csv("Aposelemis_storage.csv")
+
+# Surface Area vs. Level — approx. digitized from the figure
+surface_data <- read.csv("Aposelemis_surface.csv") 
+
+level_fun   <- approxfun(surface_data$Surface_km2, surface_data$Level_m, rule = 2)
+stor_fun    <- approxfun(storage_data$Level_m, storage_data$Storage_hm3, rule = 2)
+Amin <- min(surface_data$Surface_km2); Amax <- max(surface_data$Surface_km2)
+
+# ---- Observations (press data) ----
+observation_data <- read.csv("Aposelemis_observation.csv")
+observation_data$Date <- as.Date(observation_data$Date)
+# obs <- observation_data %>% dplyr::transmute(date = Date, Storage_obs = Storage)
+obs <- observation_data %>%
+  dplyr::transmute(
+    date = as.Date(Date),
+    Storage_obs = Storage
+  ) %>%
+  dplyr::filter(!is.na(date), is.finite(Storage_obs)) %>%
+  dplyr::group_by(date) %>%
+  dplyr::summarise(
+    Storage_obs = mean(Storage_obs, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(date)
+
+
+# ---- Date range ----
+startDate <- '2014-10-03'
+endDate <- Sys.Date() %>% format('%Y-%m-%d')
+
+# ---- Local folders ----
+# this is where satellite images are stored locally
+local.dir <- "images_aposelemis_2025.12.08"
+split.dir <- "split"
+split_dir <- file.path(local.dir, split.dir)
+dir.create(local.dir, showWarnings = FALSE)
+dir.create(split_dir, showWarnings = FALSE)
+
+# ---- Filebase ----
+# this is where metadata (currenlty only dates) on images are stored
+filename_base <- "VV_Filtered"
+meta_csv_path <- file.path(local.dir, "VV_Filtered_metadata.csv")
+
+meta_local <- if (file.exists(meta_csv_path)) {
+
+  meta_raw <- readr::read_csv(
+    meta_csv_path,
+    col_types = readr::cols(.default = readr::col_character()),
+    show_col_types = FALSE
+  )
+
+  # Fix BOM in header (common culprit)
+  names(meta_raw) <- sub("^\ufeff", "", names(meta_raw))
+
+  meta_raw <- meta_raw %>%
+    dplyr::mutate(
+      date = {
+        x <- stringr::str_trim(as.character(date))
+        x <- sub("^\ufeff", "", x)
+        lubridate::ymd(x, quiet = TRUE) %>% as.Date()
+      },
+
+      time_start_str = {
+        x <- stringr::str_trim(as.character(time_start_str))
+
+        is_num <- stringr::str_detect(x, "^[0-9]{9,12}$")
+        num <- suppressWarnings(as.numeric(x))
+
+        ok_unix_seconds <- is_num &
+          is.finite(num) &
+          num >= as.numeric(as.POSIXct("2000-01-01", tz = "UTC")) &
+          num <= as.numeric(as.POSIXct("2100-01-01", tz = "UTC"))
+
+        out <- x
+        out[ok_unix_seconds] <- format(
+          as.POSIXct(num[ok_unix_seconds], origin = "1970-01-01", tz = "UTC"),
+          "%Y-%m-%d %H:%M:%S"
+        )
+        out
+      },
+
+      relativeOrbitNumber_start = suppressWarnings(as.integer(relativeOrbitNumber_start)),
+      relativeOrbitNumber       = suppressWarnings(as.integer(relativeOrbitNumber))
+    ) %>%
+    standardize_meta()
+
+  meta_raw
+
+} else {
+  standardize_meta(tibble::tibble())
+}
+
+
+
+local_dates <- meta_local$date
+
+
+```
+
+```{r}
+#| label: setup-httr
+#| include: false
+#| cache: false
+
+# Stabilize httr/curl on HPC
+httr::set_config(httr::config(http_version = 1))
+httr::set_config(httr::config(
+  timeout = 600,
+  connecttimeout = 60,
+  forbid_reuse = TRUE,
+  fresh_connect = TRUE
+))
+
+
+
+
+```
+
+
+# Satellite data acquisition
+```{r}
+#| label: satellite-data
+#| include: false
+#| cache: false
+
+
+# ---- Region of interest coordinates ----
+coords_list <- lapply(seq_len(nrow(coords)), function(i) as.numeric(coords[i, c("X","Y")]))
+roi <- ee$Geometry$Polygon(list(coords_list))
+
+# ---- Load Sentinel-1 collection ----
+collection <- ee$ImageCollection("COPERNICUS/S1_GRD")$
+  filterBounds(roi)$
+  filterDate(startDate, endDate)$
+  filter(ee$Filter$listContains("transmitterReceiverPolarisation", "VV"))$
+  select("VV")
+
+# Clip 
+clipped_all <- collection$
+  map(function(img) img$clip(roi))
+
+# ---- Extract all acquisition dates available in EE (YYYY-MM-dd) ----
+timestamp_list <- clipped_all$aggregate_array("system:time_start")
+date_list_all_chr <- ee$List(timestamp_list)$map(
+  rgee::ee_utils_pyfunc(function(t) ee$Date(t)$format("YYYY-MM-dd"))
+)$getInfo()
+
+date_list_all_chr <- sort(unique(unlist(date_list_all_chr)))
+
+# ---- Local dates from already-downloaded per-date TIFFs (ground truth) ----
+tif_files <- list.files(split_dir, pattern = "^VV_Filtered_\\d{8}\\.tif$", full.names = TRUE)
+
+local_dates_chr <- character(0)
+if (length(tif_files) > 0) {
+  local_dates_chr <- format(
+    as.Date(sub(".*_(\\d{8})\\.tif$", "\\1", basename(tif_files)), "%Y%m%d"),
+    "%Y-%m-%d"
+  )
+}
+
+# ---- New dates are those present in EE but not present as local TIFFs ----
+new_dates <- setdiff(date_list_all_chr, local_dates_chr)
+
+# ---- helpers ----
+gcs_ls_latest_tif <- function(bucket, prefix) {
+  # Prefer gcloud / gsutil if available (more stable on HPC)
+  if (nzchar(Sys.which("gcloud"))) {
+    cmd <- sprintf('gcloud storage ls --long "gs://%s/%s**.tif*" 2>/dev/null | sort -k2 | tail -n 1', bucket, prefix)
+    line <- suppressWarnings(try(system(cmd, intern = TRUE), silent = TRUE))
+    if (!inherits(line, "try-error") && length(line) && nzchar(line[1])) {
+      gs_uri <- sub("^.*(gs://[^ ]+).*$", "\\1", line[1])
+      return(gs_uri)
+    }
+  }
+  if (nzchar(Sys.which("gsutil"))) {
+    cmd <- sprintf('gsutil ls -l "gs://%s/%s**.tif*" 2>/dev/null | sort -k2 | tail -n 1', bucket, prefix)
+    line <- suppressWarnings(try(system(cmd, intern = TRUE), silent = TRUE))
+    if (!inherits(line, "try-error") && length(line) && nzchar(line[1])) {
+      gs_uri <- sub("^.*(gs://[^ ]+).*$", "\\1", line[1])
+      return(gs_uri)
+    }
+  }
+
+  # R fallback
+  googleCloudStorageR::gcs_global_bucket(bucket)
+  objs <- googleCloudStorageR::gcs_list_objects(prefix = prefix)
+  if (is.null(objs) || nrow(objs) == 0) return(NA_character_)
+  tifs <- objs[grepl("\\.tif(f)?$", objs$name, ignore.case = TRUE), , drop = FALSE]
+  if (nrow(tifs) == 0) return(NA_character_)
+  tifs <- tifs[order(as.POSIXct(tifs$updated), decreasing = TRUE), , drop = FALSE]
+  paste0("gs://", bucket, "/", tifs$name[1])
+}
+
+wait_for_gcs_latest_tif <- function(bucket, prefix, timeout_s = 8 * 3600, sleep_s = 60) {
+  t0 <- Sys.time()
+  repeat {
+    gs_uri <- gcs_ls_latest_tif(bucket, prefix)
+    if (!is.na(gs_uri)) return(gs_uri)
+    if (as.numeric(difftime(Sys.time(), t0, units = "secs")) > timeout_s) return(NA_character_)
+    Sys.sleep(sleep_s)
+  }
+}
+
+is_google_gsutil <- function(gsutil_path) {
+  if (!nzchar(gsutil_path)) return(FALSE)
+  out <- suppressWarnings(try(system2(gsutil_path, c("version"), stdout = TRUE, stderr = TRUE), silent = TRUE))
+  if (inherits(out, "try-error")) return(FALSE)
+  grepl("gsutil version", paste(out, collapse = "\n"), ignore.case = TRUE)
+}
+
+safe_move_into_place <- function(src, dest) {
+  dir.create(dirname(dest), recursive = TRUE, showWarnings = FALSE)
+
+  # Remove any old dest (optional but keeps behavior predictable)
+  if (file.exists(dest)) file.remove(dest)
+
+  # Try rename first (fast, atomic on same filesystem)
+  ok_rename <- FALSE
+  if (file.exists(src)) {
+    ok_rename <- isTRUE(file.rename(src, dest))
+  }
+  if (ok_rename && file.exists(dest)) return(TRUE)
+
+  # Cross-filesystem fallback: copy then delete
+  ok_copy <- isTRUE(file.copy(src, dest, overwrite = TRUE))
+  if (ok_copy && file.exists(dest)) {
+    file.remove(src)
+    return(TRUE)
+  }
+
+  FALSE
+}
+
+gcs_download_atomic <- function(bucket, object_name, dest, tries = 5) {
+  # Make dest absolute-ish and stable
+  dest <- normalizePath(dest, winslash = "/", mustWork = FALSE)
+  dir.create(dirname(dest), recursive = TRUE, showWarnings = FALSE)
+
+  tmp <- file.path(tempdir(), paste0(basename(dest), ".", Sys.getpid(), ".part"))
+
+  gcloud <- Sys.which("gcloud")
+  gsutil <- Sys.which("gsutil")
+  gsutil_ok <- is_google_gsutil(gsutil)
+
+  py <- Sys.getenv("RETICULATE_PYTHON", unset = "")
+  # If you prefer hardcode fallback on HPC, uncomment:
+  # if (!nzchar(py)) py <- "/raid/daliakopoulos/miniconda3/envs/py311-ee/bin/python"
+
+  for (i in seq_len(tries)) {
+    if (file.exists(tmp)) file.remove(tmp)
+    ok <- FALSE
+
+    if (nzchar(gcloud)) {
+      cmd <- sprintf('"%s" storage cp "gs://%s/%s" "%s"', gcloud, bucket, object_name, tmp)
+      ok <- identical(system(cmd), 0L)
+
+    } else if (gsutil_ok) {
+      cmd <- sprintf('"%s" cp "gs://%s/%s" "%s"', gsutil, bucket, object_name, tmp)
+      ok <- identical(system(cmd), 0L)
+
+    } else if (nzchar(py)) {
+      py_cmd <- sprintf(
+        '"%s" -c %s',
+        py,
+        shQuote(paste0(
+          "from google.cloud import storage\n",
+          "bucket_name=", shQuote(bucket), "\n",
+          "object_name=", shQuote(object_name), "\n",
+          "dest=", shQuote(tmp), "\n",
+          "client=storage.Client()\n",
+          "b=client.bucket(bucket_name)\n",
+          "blob=b.blob(object_name)\n",
+          "blob.download_to_filename(dest)\n"
+        ))
+      )
+      ok <- identical(system(py_cmd), 0L)
+
+    } else {
+      res <- try(
+        googleCloudStorageR::gcs_get_object(
+          object_name = object_name,
+          bucket      = bucket,
+          saveToDisk  = tmp,
+          overwrite   = TRUE
+        ),
+        silent = TRUE
+      )
+      ok <- !inherits(res, "try-error")
+    }
+
+    # Validate tmp
+    if (ok && file.exists(tmp) && file.info(tmp)$size > 0) {
+      moved <- safe_move_into_place(tmp, dest)
+      if (moved && file.exists(dest) && file.info(dest)$size > 0) {
+        return(invisible(dest))
+      }
+
+      # If move failed, print a helpful log and retry
+      cat("[satellite-data] Move into place failed (tmp=", tmp, " dest=", dest, "). Retrying...\n",
+          file = stderr())
+    }
+
+    Sys.sleep(2 * i)
+  }
+
+  stop("Failed to download non-empty object after ", tries, " tries: gs://", bucket, "/", object_name)
+}
+
+
+# Optional: cap number of dates per run (set EE_MAX_EXPORT_DATES in env if desired)
+max_dates <- as.integer(Sys.getenv("EE_MAX_EXPORT_DATES", unset = "100"))
+if (!is.na(max_dates) && max_dates > 0 && length(new_dates) > max_dates) {
+  cat("[satellite-data] Capping export to latest ", max_dates, " dates (EE_MAX_EXPORT_DATES)\n", file = stderr())
+  new_dates <- tail(sort(new_dates), max_dates)
+}
+
+if (length(new_dates) == 0) {
+  cat("No new dates found. Everything is up to date.\n", file = stderr())
+} else {
+  cat("Found", length(new_dates), "new dates. Proceeding with export.\n", file = stderr())
+
+  # Unique folder for this export (do NOT pre-create it)
+  timestamp_tag <- format(Sys.time(), "%Y%m%d_%H%M%S")
+  unique_folder_name <- paste0("aposelemis_export_", timestamp_tag)
+  prefix <- paste0("gee-exports/", unique_folder_name, "/")
+
+  # Build new ImageCollection from new dates
+  build_image_for_date <- function(date_str) {
+    ee$Image(
+      clipped_all$
+        filterDate(date_str, as.character(as.Date(date_str) + 1))$
+        first()
+    )$set("system:index", date_str)
+  }
+
+  images_list    <- lapply(new_dates, build_image_for_date)
+  new_collection <- ee$ImageCollection$fromImages(images_list)
+
+  count_new <- new_collection$size()$getInfo()
+  if (count_new == 0) stop("No valid images found for new dates.", call. = FALSE)
+
+  stacked_new <- new_collection$select("VV")$toBands()
+
+  # ---- Export to GCS (submit only; do not rely on ee_monitoring) ----
+  task <- ee_image_to_gcs(
+    image          = stacked_new,
+    description    = paste0(filename_base, "_", unique_folder_name),
+    bucket         = bucket,
+    fileNamePrefix = paste0(prefix, filename_base),
+    fileFormat     = "GeoTIFF",
+    region         = roi,
+    scale          = 10,
+    maxPixels      = 1e10
+  )
+
+  cat("[satellite-data] Starting export task...\n", file = stderr())
+  tryCatch(task$start(), error = function(e) {
+    cat("[satellite-data] task$start() error: ", conditionMessage(e), "\n", file = stderr())
+  })
+
+  # ---- Wait for output to appear in GCS (ground truth) ----
+  cat("[satellite-data] Waiting for output GeoTIFF in GCS under prefix: ", prefix, "\n", file = stderr())
+  gs_uri <- wait_for_gcs_latest_tif(bucket = bucket, prefix = prefix, timeout_s = 8 * 3600, sleep_s = 60)
+
+  if (is.na(gs_uri)) {
+    stop("Timed out waiting for GeoTIFF in GCS under prefix: ", prefix, call. = FALSE)
+  }
+
+  cat("[satellite-data] Found output: ", gs_uri, "\n", file = stderr())
+
+  object_name <- sub(paste0("^gs://", bucket, "/"), "", gs_uri)
+
+  # ---- Download from GCS atomically ----
+  stacked_local_path <- file.path(local.dir, paste0(filename_base, ".tif"))
+  cat("[satellite-data] Downloading to: ", stacked_local_path, "\n", file = stderr())
+
+  gcs_download_atomic(bucket = bucket, object_name = object_name, dest = stacked_local_path, tries = 5)
+
+  cat("[satellite-data] Download completed from GCS: ", stacked_local_path, "\n", file = stderr())
+
+  # ---- Split stacked bands into per-date GeoTIFFs ----
+  stack_rast <- rast(stacked_local_path)
+  stopifnot(nlyr(stack_rast) == length(new_dates))
+
+  for (i in seq_len(nlyr(stack_rast))) {
+    out_date <- gsub("-", "", new_dates[i])  # YYYYMMDD
+    out_name <- file.path(split_dir, paste0("VV_Filtered_", out_date, ".tif"))
+    cat("[satellite-data] Saving new band ", i, " as ", out_name, "\n", file = stderr())
+    writeRaster(stack_rast[[i]], out_name, overwrite = TRUE)
+  }
+
+  # ---- fetch + append metadata for the new dates ----
+meta_new <- fetch_s1_metadata_for_dates(
+  roi = roi, startDate = startDate, endDate = endDate, dates_vec = new_dates
+)
+
+# make types compatible (especially date)
+meta_new <- standardize_meta(meta_new)
+
+meta_local <- dplyr::bind_rows(meta_local, meta_new) %>%
+  dplyr::distinct(date, .keep_all = TRUE) %>%
+  dplyr::arrange(date)
+
+readr::write_csv(meta_local, meta_csv_path)
+
+  cat("Metadata cache updated:", meta_csv_path, "\n", file = stderr())
+}
+
+cat("Process completed.\n", file = stderr())
+
+# ---- Update local_dates as Date vector for downstream code ----
+# after building local_dates_chr
+local_dates <- as.Date(local_dates_chr, "%Y-%m-%d")
+
+candidate_dates <- local_dates[local_dates > as.Date(startDate)]
+first_date <- if (length(candidate_dates) > 0) min(candidate_dates) else NA_Date_
+last_date  <- max(local_dates[local_dates < as.Date(endDate)],  na.rm = TRUE)
+dates_between <- sum(local_dates >= first_date & local_dates <= last_date, na.rm = TRUE)
+
+n_asc <- nrow(meta_local %>% dplyr::filter(orbitProperties_pass=="ASCENDING")) 
+n_desc <- nrow(meta_local %>% dplyr::filter(orbitProperties_pass=="DESCENDING"))
+n_s1a <- nrow(meta_local %>% dplyr::filter(platform_number =="A"))
+n_s1b <- nrow(meta_local %>% dplyr::filter(platform_number =="B"))
+n_s1c <- nrow(meta_local %>% dplyr::filter(platform_number =="C"))
+
+```
+
+The dataset used spans the period from `r first_date` to `r last_date`, yielding a total of `r dates_between`  acquisitions over the study area. These originate from the three Sentinel-1 platforms: `r n_s1a` from Sentinel-1A, `r n_s1b` from Sentinel-1B, and `r n_s1c` from Sentinel-1C. Although the platforms correspond to slightly different acquisition geometries and calibration settings, all scenes were pre-processed in a homogeneous way, including thermal noise removal, radiometric calibration, and terrain correction. As a result, differences between platforms are not expected to significantly influence the retrieval of water surfaces once standard calibration and thresholding are applied. The collection also includes a mixture of orbital geometries, with `r n_asc` acquisitions in ascending orbit and `r n_desc` in descending orbit. 
+
+```{r}
+#| label: computations
+#| include: false
+#| cache: false
+
+# =========================
+# COMPUTATIONS (ASC vs DESC)
+# =========================
+
+# --- user choices ---
+smooth_k <- 30                # rolling median window [d]
+support_window_days <- 15     # require an acquisition within ± this window [d]
+B_boot <- 2000                # block bootstrap replicates
+# Optional: force a fixed block length for all configs (else AR(1)-based per config)
+L_fixed <- NULL               # e.g., 10  (set NULL to auto)
+
+
+# tunable parameters
+thresholds_dB <- -seq(15, 25, by = 0.1)   # e.g., -15:-25 dB
+radii_m       <- seq(10, 200, by = 10)                # window radii in meters
+# smooth_k      <- 30                     # median window (days) for daily series
+# number_of_cores <- 5
+
+# Compute areas for grid
+# ---- cores/workers: prefer scheduler allocation; fallback to detected cores ----
+sched_cores <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", unset = NA))
+if (is.na(sched_cores)) sched_cores <- as.integer(Sys.getenv("PBS_NP", unset = NA))
+if (is.na(sched_cores)) sched_cores <- as.integer(Sys.getenv("NSLOTS", unset = NA))
+
+avail <- parallelly::availableCores()
+workers <- if (!is.na(sched_cores)) sched_cores else avail
+
+# cap workers to avoid oversubscription / socket limits
+workers <- max(1, min(workers, 32))  # 32 is a sane cap for this workflow
+
+op <- future::plan()
+future::plan(multisession, workers = workers)
+
+
+tif_files <- list.files(split_dir, pattern = "\\.tif$", full.names = TRUE)
+template  <- terra::rast(tif_files[1])
+px        <- terra::res(template)[1]
+
+w_list <- setNames(
+  lapply(radii_m, function(r) { w <- terra::focalMat(template, r, "circle"); w[w > 0] <- 1; w }),
+  as.character(radii_m)
+)
+
+grid_list <- future.apply::future_lapply(
+  tif_files,
+  compute_grid_for_image,
+  thresholds_dB = thresholds_dB,
+  radii_m       = radii_m,
+  w_list        = w_list,
+  px            = px,
+  use_values    = TRUE,
+  future.seed   = TRUE
+)
+
+
+
+ 
+grid_results <- dplyr::bind_rows(grid_list)
+
+df_all_joined <- grid_results %>%
+  dplyr::mutate(
+    date = as.Date(Date),
+    water_area_sqkm = WaterArea_m2 / 1e6,
+    storage = area_to_storage(water_area_sqkm)
+  ) %>%
+  dplyr::left_join(meta_local, by = "date")
+
+# --- build orbit-specific evaluated tables (sampled on observation dates) ---
+eval_asc <- make_orbit_eval(
+  df_all_joined,
+  orbit = "ASCENDING",
+  smooth_k = smooth_k,
+  obs_tbl = obs,                 # must contain: date, Storage_obs
+  support_window_days = support_window_days
+)
+
+eval_desc <- make_orbit_eval(
+  df_all_joined,
+  orbit = "DESCENDING",
+  smooth_k = smooth_k,
+  obs_tbl = obs,
+  support_window_days = support_window_days
+)
+
+# --- align ASC and DESC to identical timestamps per (Threshold, Radius) ---
+aligned <- align_orbits_by_common_dates(eval_asc, eval_desc)
+
+comp_orbits <- dplyr::bind_rows(aligned$asc, aligned$desc)
+
+# quick sanity check: same dates per (T,r) after alignment
+# comp_orbits %>% count(Threshold_dB, Radius_m, orbit) %>% print(n=50)
+
+# --- compute metrics + time-aware (block) bootstrap uncertainty ---
+# metrics_orbits <- compute_metrics_orbits_blockboot(
+#   aligned_tbl = comp_orbits,
+#   B = B_boot,
+#   L = L_fixed
+# )
+
+# (still under the same multisession plan)
+metrics_orbits <- compute_metrics_orbits_blockboot_parallel(
+  aligned_tbl = comp_orbits,
+  B = B_boot,
+  L = L_fixed
+)
+
+future::plan(op)   # restore ONCE at the end
+
+
+# --- choose best (Threshold, Radius) per orbit (example rule) ---
+best_orbit <- best_by_orbit(metrics_orbits)
+
+# --- optional: show best results ---
+# best_orbit %>%
+#   dplyr::select(
+#     orbit, Threshold_dB, Radius_m, n, block_L, resid_ar1,
+#     RMSE_point, RMSE_lo, RMSE_hi,
+#     R2_point, R2_lo, R2_hi,
+#     KGE_point, KGE_lo, KGE_hi,
+#     r_point, r_lo, r_hi, Neff
+#   ) %>%
+#   print(n = Inf)
+
+# =========================
+# OPTIONAL: plotting-friendly long format (point + CI)
+# =========================
+metrics_orbits_long <- metrics_orbits %>%
+  dplyr::select(Threshold_dB, Radius_m, orbit,
+                RMSE_point, RMSE_lo, RMSE_hi,
+                R2_point,   R2_lo,   R2_hi,
+                KGE_point,  KGE_lo,  KGE_hi) %>%
+  tidyr::pivot_longer(
+    cols = -c(Threshold_dB, Radius_m, orbit),
+    names_to = c("Metric", ".value"),
+    names_pattern = "(RMSE|R2|KGE)_(point|lo|hi)"
+  ) %>%
+  dplyr::rename(median = point) %>%   # keep your old plotting code conventions if you like
+  dplyr::mutate(Metric = factor(Metric, levels = c("KGE", "R2", "RMSE")))
+
+# Mark best (per orbit) in long format (for red dots etc.)
+best_orbit_long <- metrics_orbits_long %>%
+  dplyr::semi_join(best_orbit, by = c("orbit", "Threshold_dB", "Radius_m"))
+
+# ---- extract best ASC predictions ----
+pred_best_asc <- comp_orbits %>%
+  dplyr::semi_join(
+    best_orbit %>% dplyr::filter(orbit == "ASCENDING"),
+    by = c("Threshold_dB", "Radius_m", "orbit")
+  ) %>%
+  dplyr::arrange(date)
+
+# ---- extract best DESC predictions ----
+pred_best_desc <- comp_orbits %>%
+  dplyr::semi_join(
+    best_orbit %>% dplyr::filter(orbit == "DESCENDING"),
+    by = c("Threshold_dB", "Radius_m", "orbit")
+  ) %>%
+  dplyr::arrange(date)
+
+
+
+```
+
+
+
+
+
+
+# Effect of threshold
+
+```{r}
+#| label: example-threshold-effect
+#| include: false
+#| cache: false
+
+# Threshold x radius raster grid (example)
+files <- list.files(split_dir, pattern = "\\.tif$", full.names = TRUE)
+get_date <- function(f) as.Date(sub(".*_(\\d{8}).*", "\\1", basename(f)), "%Y%m%d")
+dates_v <- vapply(files, get_date, as.Date("1970-01-01"))
+win <- files[dates_v >= as.Date("2020-12-01") & dates_v <= as.Date("2021-02-28")]
+stopifnot(length(win) >= 1)
+image_path <- win[1]
+r <- rast(image_path)
+
+rad_order <- c(20, 50, 80)
+thr_order  <- c(-20, -15, -10)   # dB
+
+# if (!exists("filt_list")) {
+  w_list    <- setNames(lapply(rad_order, \(rad) mk_window(r, rad)), rad_order)
+  filt_list <- lapply(w_list, \(w) filter_band_linear_to_db(r, w))
+# }
+
+soil_rows  <- list()
+water_rows <- list()
+
+for (ri in seq_along(rad_order)) {
+  rad <- rad_order[ri]
+  fdb <- filt_list[[ri]]
+  for (t in thr_order) {
+    water_vals <- terra::ifel(fdb < t, fdb, NA)
+    soil_mask  <- terra::ifel(fdb >= t, 1, NA)
+
+    nm <- sprintf("thr %s dB | rad %dm", t, rad)
+    names(water_vals) <- nm
+    names(soil_mask)  <- nm
+
+    df_w <- terra::as.data.frame(water_vals, xy = TRUE, na.rm = FALSE) |>
+      tidyr::pivot_longer(-c(x, y), names_to = "layer", values_to = "water_value") |>
+      dplyr::mutate(
+        threshold = as.integer(stringr::str_match(layer, "thr\\s*(-?\\d+)")[,2]),
+        radius_m  = as.integer(stringr::str_match(layer, "rad\\s*(\\d+)m")[,2])
+      )
+
+    df_s <- terra::as.data.frame(soil_mask,   xy = TRUE, na.rm = TRUE) |>
+      tidyr::pivot_longer(-c(x, y), names_to = "layer", values_to = "soil_flag") |>
+      dplyr::mutate(
+        threshold = as.integer(stringr::str_match(layer, "thr\\s*(-?\\d+)")[,2]),
+        radius_m  = as.integer(stringr::str_match(layer, "rad\\s*(\\d+)m")[,2])
+      )
+
+    water_rows[[length(water_rows)+1]] <- df_w
+    soil_rows[[length(soil_rows)+1]]   <- df_s
+  }
+}
+
+df_water <- dplyr::bind_rows(water_rows) |>
+  dplyr::mutate(
+    threshold_f = factor(threshold, levels = sort(unique(threshold), decreasing = TRUE)),
+    radius_f    = factor(radius_m,  levels = sort(unique(radius_m)))
+  )
+
+
+
+df_soil <- dplyr::bind_rows(soil_rows) |>
+  dplyr::mutate(
+    threshold_f = factor(threshold, levels = sort(unique(threshold), decreasing = TRUE)),
+    radius_f    = factor(radius_m,  levels = sort(unique(radius_m)))
+  )
+
+```
+
+Water detection relied on two variables applied to backscatter values. First, a median filter was applied to reduce speckle noise, acknowledging that larger filter sizes improve smoothing but reduce local detail. Second, a threshold value T was used: pixels with backscatter values lower than T were classified as water, while all others were labelled as land. Proper selection of the threshold T is essential; increasing T expands the mapped water area and can lead to overestimation, whereas decreasing it risks missing parts of the reservoir. [@fig-example-threshold-effect] shows the effect of T on a 10 m resolution VV-polarized SAR image (part of the analysed dataset).
+
+ 
+
+```{r}
+#| fig-cap: "Effect of threshold T [dB] on water masking on a 10 m resolution VV-polarized Sentinel-1 SAR image." 
+#| label: fig-example-threshold-effect
+#| include: true
+#| cache: false
+
+
+# pick one setting (example)
+df_one <- df_water |>
+  dplyr::filter(threshold == df_water$threshold[1], 
+                radius_m == df_water$radius_m[1]) |>
+  dplyr::select(x, y, water_value)
+
+grid_stack <- terra::rast(df_one, type = "xyz")
+
+# OPTIONAL: zoom box in raster coordinates (set to NULL to show all)
+# Use terra::ext(grid_stack) to inspect extent
+e <- terra::ext(grid_stack)
+bbox <- NULL
+
+s_startx <- 800
+s_starty <- 800
+s_size <- 750
+
+bbox <- list(xmin = e$xmin + s_startx, xmax = e$xmin + s_startx + s_size,
+             ymin = e$ymin + s_starty, ymax = e$ymin + s_starty + s_size)
+
+
+p <- ggplot() +
+    # 1) SOIL / NON-WATER (discrete legend, ordered second)
+    geom_raster(
+      data = df_soil,
+      aes(x, y, fill = "No water"),
+      inherit.aes = FALSE
+    ) +
+    scale_fill_manual(
+      name  = "",
+      values = c("No water" = "grey80"),
+      guide  = guide_legend(order = 2, override.aes = list(alpha = 1))
+    ) +
+    ggnewscale::new_scale_fill() +
+    
+    # 2) WATER (continuous colorbar, ordered first)
+    geom_raster(
+      data = df_water,
+      aes(x, y, fill = water_value),
+      inherit.aes = FALSE,
+      na.rm = TRUE
+    ) +
+    scale_fill_viridis_c(
+      name = "Water [dB]",
+      option = "C", direction = -1,
+      na.value = NA,
+      oob = scales::squish,
+      guide = guide_colorbar(order = 1, barheight = unit(5, "cm"))
+    ) +
+    coord_equal(
+      xlim = if (!is.null(bbox)) c(bbox$xmin, bbox$xmax) else NULL,
+      ylim = if (!is.null(bbox)) c(bbox$ymin, bbox$ymax) else NULL,
+      expand = FALSE
+    ) +
+    facet_grid(rows = vars(threshold_f), cols = vars(radius_f), switch = "both") +
+    labs(y = "Threshold [dB]", x = "Radius [m]") +
+    theme_void() +
+    theme(
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+      axis.title.x = element_text(margin = margin(t = 6)),
+      axis.title.y = element_text(angle = 90, margin = margin(r = 6)),
+      axis.text    = element_blank(),
+      axis.ticks   = element_blank(),
+      strip.text.y = element_blank(),
+      strip.placement = "outside",
+      legend.position = "right",
+      legend.box = "vertical"
+    )
+  
+  print(p)
+  
+  # ---- ORIGINAL ggsave (same filename; saved into out_dir) ----
+  ggsave(
+    filename = file.path(out_dir, "fig_threshold_radius_grid_ggplot_zoom.png"),
+    plot = p, width = 15, height = 8, dpi = 1200, units = "cm"
+  )
+
+save_fig_rds("fig-example-threshold-effect", list(
+  df_water   = df_water,
+  df_soil    = df_soil,
+  bbox       = bbox,
+  base_size  = base_size
+))
+
+
+```
+
+
+
+# Dam area and storage
+The transformation from water surface area to storage volume in Aposelemis dam relies on the design storage-area-elevation relationship (Koutsoyiannis et al., 2001). [@fig-storage-curves] shows the original design curves; rearranging these relationships yields the direct area-storage curve ([@fig-storage-curves] b), used to convert remotely sensed reservoir areas into storage estimates. 
+
+```{r}
+#| fig-cap: "(a) Design storage-area-elevation curve after Sadeghian et al., 2017 and (b) estimated area-storage curve for Aposelemis dam."
+#| label: fig-storage-curves
+#| include: true
+#| cache: false
+
+# ---------------- Curves figure (uses global storage_data & surface_data) ----------------
+Amin <- min(surface_data$Surface_km2); Amax <- max(surface_data$Surface_km2)
+Smin <- min(storage_data$Storage_hm3); Smax <- max(storage_data$Storage_hm3)
+
+Smin_rev <- Smax; Smax_rev <- Smin  # reversed for decreasing labels
+scale_S_to_A <- function(S) (S - Smin_rev) / (Smax_rev - Smin_rev) * (Amax - Amin) + Amin
+inv_A_to_S  <- function(A) (A - Amin) / (Amax - Amin) * (Smax_rev - Smin_rev) + Smin_rev
+
+storage_scaled <- transform(storage_data, Storage_on_Axis = scale_S_to_A(Storage_hm3))
+
+  p_left <- ggplot() +
+    geom_line(aes(x = Surface_km2, y = Level_m), data = surface_data, linewidth = 1, color = "#D55E00") +
+    geom_point(aes(x = Surface_km2, y = Level_m), data = surface_data, size = 2, shape = 21, fill="white", color = "#D55E00") +
+    geom_line(aes(x = Storage_on_Axis, y = Level_m), data = storage_scaled, linewidth = 1, color = "#0072B2") +
+    geom_point(aes(x = Storage_on_Axis, y = Level_m), data = storage_scaled, size = 2, shape = 21, fill="white", color = "#0072B2") +
+    scale_x_continuous(
+      name = expression("Area [k"*m^2*"]"),
+      sec.axis = sec_axis(~ inv_A_to_S(.), name = expression("Storage [h"*m^3*"]"))
+    ) +
+    labs(y = "Elevation [m]", title = NULL) +
+    theme_bw() +
+    theme(plot.title.position = "plot", axis.title.x.top = element_text(margin = margin(b = 8)))
+  
+  Aseq <- seq(Amin, Amax, by = 0.01)
+  Vseq <- area_to_storage(Aseq)
+  curve_df <- data.frame(Area = Aseq, Storage = as.numeric(Vseq))
+  
+  stor_on_surface_levels <- approx(
+    x = storage_data$Level_m, y = storage_data$Storage_hm3,
+    xout = surface_data$Level_m, method = "linear", ties = mean
+  )$y
+  area_points <- data.frame(Area = surface_data$Surface_km2, Storage = stor_on_surface_levels)
+  
+  p_right <- ggplot(curve_df, aes(x = Area, y = Storage)) +
+    geom_line(linewidth = 1) +
+    geom_point(data = area_points, aes(x = Area, y = Storage), size = 2, shape = 21, fill="white", color = "black") +
+    scale_x_continuous(name = expression("Area [k"*m^2*"]")) +
+    scale_y_continuous(position = "right") +
+    labs(title = NULL, y = expression("Storage [h"*m^3*"]")) +
+    theme_bw() +
+    theme(plot.background=element_blank())
+  
+  p_left  <- p_left  + theme(plot.margin = margin(2, 2, 2, 2))
+  p_right <- p_right + theme(plot.margin = margin(2, 2, 2, 2))
+  
+  # p_curves <- cowplot::plot_grid(
+  #   p_left, NULL, p_right,
+  #   rel_widths = c(10, -1, 10),
+  #   align = "hv", labels = c("a", "", "b"), nrow = 1
+  # )
+  
+  p_curves <- ggarrange(p_left, p_right, 
+            labels = c("a", "b"),
+            align = "hv",
+            ncol = 2, nrow = 1)
+  
+  print(p_curves)
+  
+  ggsave(
+    filename = file.path(out_dir, "fig_curves_ggplot.png"),
+    plot = p_curves, width = 18, height = 8, dpi = 1200, units = "cm"
+  )
+
+save_fig_rds("fig-storage-curves", list(
+  storage_data = storage_data,
+  surface_data = surface_data,
+  Amin = Amin, Amax = Amax
+))
+
+```
+
+
+
+# Storage estimates validation 
+All performance metrics (RMSE, R², and KGE) were computed using paired observations between satellite- and reference-derived storage values. To assess statistical robustness, 95% confidence intervals were obtained through a circular moving-block bootstrap (B = 2000), which accounts for temporal autocorrelation in the residuals. In addition, correlation coefficients (r), from which R² values were derived, were accompanied by Fisher-z confidence limits based on the effective sample size (Neff) following Pyper and Peterman (1998), thereby adjusting for serial dependence. KGE was preferred as a primary performance metric because it decomposes model performance into correlation, bias, and variability components, thereby offering a more informative evaluation of agreement between satellite-derived and reference storage time series than single-criterion measures.
+
+```{r}
+#| label: bootstrap
+#| include: true
+#| cache: false
+
+# =========================
+# ORBIT COMPARISON (ASC vs DESC) + BLOCK BOOTSTRAP
+# (single-pass, reuse-if-exists)
+# =========================
+
+# ---- Settings (define once here if not defined earlier) ----
+# if (!exists("smooth_k"))             smooth_k <- 15              # rolling median window [d]
+# if (!exists("support_window_days"))  support_window_days <- 15   # support window [d]
+# if (!exists("B_boot"))               B_boot <- 2000              # bootstrap replicates [-]
+# if (!exists("L_fixed"))              L_fixed <- NULL             # block length [d] (NULL = auto)
+
+
+# ---- Choose best per orbit (maximize KGE; tie-break by RMSE) ----
+best_orbit <- best_by_orbit(metrics_orbits)
+
+# ---- Long format for plotting & reporting ----
+metrics_orbits_long <- metrics_orbits %>%
+  dplyr::select(
+    Threshold_dB, Radius_m, orbit,
+    RMSE_point, RMSE_lo, RMSE_hi,
+    MAE_point,  MAE_lo,  MAE_hi,
+    R2_point,   R2_lo,   R2_hi,
+    KGE_point,  KGE_lo,  KGE_hi
+  ) %>%
+  tidyr::pivot_longer(
+    cols = -c(Threshold_dB, Radius_m, orbit),
+    names_to = c("Metric", ".value"),
+    names_pattern = "(RMSE|MAE|R2|KGE)_(point|lo|hi)"
+  ) %>%
+  dplyr::rename(estimate = point) %>%
+  dplyr::mutate(Metric = factor(Metric, levels = c("KGE", "R2", "RMSE", "MAE")))
+
+best_orbit_long <- metrics_orbits_long %>%
+  dplyr::semi_join(best_orbit, by = c("orbit", "Threshold_dB", "Radius_m"))
+
+# ---- Dual “views” used by Fig. 3 logic (threshold-view and radius-view) ----
+metrics_orbits_dual <- dplyr::bind_rows(
+  # View A: x = Threshold, lines = Radius
+  metrics_orbits_long %>%
+    dplyr::mutate(
+      view = "Threshold view",
+      x = Threshold_dB,
+      line_id = factor(Radius_m)
+    ),
+  # View B: x = Radius, lines = Threshold
+  metrics_orbits_long %>%
+    dplyr::mutate(
+      view = "Radius view",
+      x = Radius_m,
+      line_id = factor(Threshold_dB)
+    )
+) %>%
+  dplyr::mutate(
+    orbit = factor(orbit,
+                   levels = c("ASCENDING","DESCENDING"),
+                   labels = c("Ascending","Descending")),
+    view = factor(view, levels = c("Threshold view","Radius view"))
+  )
+
+# ---- Convenience strings for narrative text (if you use them later) ----
+fmt_ci <- function(est, lo, hi, digits = 2) {
+  if (any(!is.finite(c(est, lo, hi)))) return(NA_character_)
+  sprintf(paste0("%.", digits, "f (%.", digits, "f–%.", digits, "f)"), est, lo, hi)
+}
+
+best_asc  <- best_orbit %>% dplyr::filter(orbit == "ASCENDING")  %>% dplyr::slice(1)
+best_desc <- best_orbit %>% dplyr::filter(orbit == "DESCENDING") %>% dplyr::slice(1)
+
+rad_min <- min(best_orbit$Radius_m, na.rm = TRUE)
+rad_max <- max(best_orbit$Radius_m, na.rm = TRUE)
+
+asc_thr  <- best_asc$Threshold_dB
+asc_rad  <- best_asc$Radius_m
+asc_n    <- best_asc$n
+asc_neff <- best_asc$Neff
+asc_kge  <- fmt_ci(best_asc$KGE_point,  best_asc$KGE_lo,  best_asc$KGE_hi,  digits = 3)
+asc_r2   <- fmt_ci(best_asc$R2_point,   best_asc$R2_lo,   best_asc$R2_hi,   digits = 3)
+asc_rmse <- fmt_ci(best_asc$RMSE_point, best_asc$RMSE_lo, best_asc$RMSE_hi, digits = 2)
+
+desc_thr  <- best_desc$Threshold_dB
+desc_rad  <- best_desc$Radius_m
+desc_n    <- best_desc$n
+desc_neff <- best_desc$Neff
+desc_kge  <- fmt_ci(best_desc$KGE_point,  best_desc$KGE_lo,  best_desc$KGE_hi,  digits = 3)
+desc_r2   <- fmt_ci(best_desc$R2_point,   best_desc$R2_lo,   best_desc$R2_hi,   digits = 3)
+desc_rmse <- fmt_ci(best_desc$RMSE_point, best_desc$RMSE_lo, best_desc$RMSE_hi, digits = 2)
+
+# =========================
+# Table (best per orbit)
+# =========================
+
+# best_orbit_tbl <- best_orbit %>%
+#   dplyr::mutate(
+#     orbit = factor(orbit, levels = c("ASCENDING","DESCENDING"),
+#                    labels = c("Ascending","Descending"))
+#   ) %>%
+#   dplyr::transmute(
+#     Orbit = orbit,
+#     `Threshold [dB]` = Threshold_dB,
+#     `Radius [m]` = Radius_m,
+# 
+#     `n [-]` = n,
+#     `Neff [-]` = round(Neff, 1),
+#     `Block length L [d]` = block_L,
+#     `AR(1) residual ρ [-]` = round(resid_ar1, 3),
+# 
+#     `RMSE [hm³]` = sprintf("%.2f (%.2f–%.2f)", RMSE_point, RMSE_lo, RMSE_hi),
+#     `MAE [hm³]`  = sprintf("%.2f (%.2f–%.2f)", MAE_point,  MAE_lo,  MAE_hi),
+#     `KGE [-]`    = sprintf("%.3f (%.3f–%.3f)", KGE_point,  KGE_lo,  KGE_hi),
+#     `R² [-]`     = sprintf("%.3f (%.3f–%.3f)", R2_point,   R2_lo,   R2_hi),
+#     `r [-] (Fisher-z, Neff)` = sprintf("%.3f (%.3f–%.3f)", r_point, r_lo, r_hi)
+#   )
+# 
+# ft_best_orbit <- flextable::flextable(best_orbit_tbl) %>%
+#   flextable::autofit() %>%
+#   flextable::align(align = "center", part = "all") %>%
+#   flextable::bold(part = "header")
+# 
+# ft_best_orbit
+
+```
+
+[@tbl-best-parameters] summarizes the optimal parameter configuration identified independently for ascending and descending Sentinel-1 orbits. For each orbit, the selected backscatter threshold and spatial smoothing radius correspond to the parameter combination that maximized Kling–Gupta Efficiency (KGE), with ties resolved by lower RMSE. The optimal radii converged to moderate-to-large spatial smoothing scales (`r rad_min`–`r rad_max` m), indicating that speckle reduction and spatial aggregation dominate retrieval performance for this reservoir, while further increases in smoothing yield diminishing improvements. For the ascending orbit, the selected configuration was T = `r asc_thr` dB and r = `r asc_rad` m, yielding KGE = `r asc_kge`, R² = `r asc_r2`, and RMSE = `r asc_rmse` based on n = `r asc_n` paired comparisons (Neff = `r round(asc_neff, 1)`). For the descending orbit, the selected configuration was T = `r desc_thr` dB and r = `r desc_rad` m, yielding KGE = `r desc_kge`, R² = `r desc_r2`, and RMSE = `r desc_rmse` based on n = `r desc_n` paired comparisons (Neff = `r round(desc_neff, 1)`). Performance metrics are reported as point estimates with associated 95% confidence intervals derived from a circular moving-block bootstrap that accounts for temporal autocorrelation; correlation-based uncertainty is additionally reported via Fisher-z confidence limits using the effective sample size (Neff).
+
+
+
+```{r}
+#| label: tbl-best-parameters
+#| tbl-cap: "Best parameter configuration per orbit. Metrics are point estimates with 95% circular moving-block bootstrap CIs; correlation uses Fisher-z confidence limits based on Neff."
+
+
+# ---- flextable summary of best per orbit ----
+best_orbit_tbl <- best_orbit %>%
+  dplyr::mutate(
+    orbit = factor(orbit, levels = c("ASCENDING","DESCENDING"),
+                   labels = c("Ascending","Descending"))
+  ) %>%
+  dplyr::transmute(
+    Orbit = orbit,
+    `Threshold [dB]` = Threshold_dB,
+    `Radius [m]` = Radius_m,
+
+    `n [-]` = n,
+    `Neff [-]` = round(Neff, 1),
+    `Block length L [-]` = block_L,
+    `AR(1) residual ρ [-]` = round(resid_ar1, 3),
+
+    `RMSE [hm³]` = sprintf("%.2f (%.2f–%.2f)", RMSE_point, RMSE_lo, RMSE_hi),
+    `MAE [hm³]`  = sprintf("%.2f (%.2f–%.2f)", MAE_point,  MAE_lo,  MAE_hi),
+    `KGE [-]`    = sprintf("%.3f (%.3f–%.3f)", KGE_point,  KGE_lo,  KGE_hi),
+    `R² [-]`     = sprintf("%.3f (%.3f–%.3f)", R2_point,   R2_lo,   R2_hi),
+
+    # Fisher-z CI for r using Neff (already computed in corr_ci_neff())
+    `r [-] (Fisher-z, Neff)` = sprintf("%.3f (%.3f–%.3f)", r_point, r_lo, r_hi)
+  )
+
+ft_best_orbit <- flextable::flextable(best_orbit_tbl) %>%
+  flextable::autofit() %>%
+  flextable::align(align = "center", part = "all") %>%
+  flextable::bold(part = "header")  
+
+ft_best_orbit
+
+```
+
+```{r}
+#| label: choose-default-orbit
+#| include: false
+#| cache: false
+
+# Choose which orbit you want to drive the rest of the figures/tables
+default_orbit <- "DESCENDING"   # or "ASCENDING"
+
+metrics_default <- metrics_orbits_long %>%
+  dplyr::filter(orbit == default_orbit)
+
+best_default <- best_orbit %>%
+  dplyr::filter(orbit == default_orbit)
+
+best_default_long <- best_orbit_long %>%
+  dplyr::filter(orbit == default_orbit)
+```
+
+
+```{r}
+#| fig-cap: "Model performance as a function of threshold [dB] and radius [m] for ascending and descending orbits. Rows show KGE [-], R² [-], RMSE [hm³], and MAE [hm³]. Dashed vertical lines indicate the optimal parameter (T* or r*) per orbit."
+#| label: fig-metric
+#| include: true
+#| cache: false
+
+# ---- prep plotting tables ----
+metrics_orbits_long_plot <- metrics_orbits_long %>%
+  dplyr::mutate(
+    orbit = factor(orbit,
+                   levels = c("ASCENDING","DESCENDING"),
+                   labels = c("Ascending","Descending"))
+  )
+
+best_orbit_plot <- best_orbit %>%
+  dplyr::mutate(
+    orbit = factor(orbit,
+                   levels = c("ASCENDING","DESCENDING"),
+                   labels = c("Ascending","Descending"))
+  )
+
+# optimal x-intercepts per orbit
+opt_thr <- best_orbit_plot %>%
+  dplyr::transmute(orbit, xopt = Threshold_dB, label = sprintf("T* = %.1f dB", Threshold_dB))
+
+opt_rad <- best_orbit_plot %>%
+  dplyr::transmute(orbit, xopt = Radius_m, label = sprintf("r* = %d m", Radius_m))
+
+# ---- View A: x = Threshold, lines = Radius (RED) ----
+df_thr <- metrics_orbits_long_plot %>%
+  dplyr::mutate(
+    x = Threshold_dB,
+    line_id = Radius_m,
+    lwd = Radius_m
+  )
+
+p_thr <- ggplot(df_thr, aes(x = x, y = estimate, group = line_id)) +
+    geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.18) +
+    geom_line(aes(color = line_id, linewidth = lwd, alpha = 0.9)) +
+    geom_vline(data = opt_thr, aes(xintercept = xopt), linetype = "dashed", linewidth = 0.4) +
+    facet_grid(
+      Metric ~ orbit,
+      scales = "free_y",
+      labeller = labeller(
+        Metric = c(KGE = "KGE [-]", R2 = "R² [-]", RMSE = "RMSE [hm³]", MAE = "MAE [hm³]")
+      )
+    ) +
+    scale_color_gradient(low = "mistyrose2", high = "#D55E00", name = NULL) +
+    scale_x_continuous(
+      breaks = function(lims)
+        seq(ceiling(lims[1] / 2) * 2, floor(lims[2] / 2) * 2, by = 2),
+      labels = scales::number_format(accuracy = 1)
+    ) +
+    scale_linewidth(range = c(0.3, 1.2), guide = "none") +
+    labs(x = "Threshold [dB]", y = NULL) +
+    theme_bw(base_size = base_size) +
+    theme(
+      legend.position = "none",
+      strip.placement = "outside",
+      strip.background = element_blank()
+    )
+  
+  # View B: x = Radius, lines = Threshold
+  df_rad <- metrics_orbits_long_plot %>%
+    dplyr::mutate(
+      x = Radius_m,
+      line_id = Threshold_dB,
+      lwd = abs(Threshold_dB)
+    )
+  
+  p_rad <- ggplot(df_rad, aes(x = x, y = estimate, group = line_id)) +
+    geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.18) +
+    geom_line(aes(color = line_id, linewidth = lwd)) +
+    geom_vline(data = opt_rad, aes(xintercept = xopt), linetype = "dashed", linewidth = 0.4) +
+    facet_grid(
+      Metric ~ orbit,
+      scales = "free_y",
+      labeller = labeller(
+        Metric = c(KGE = "KGE [-]", R2 = "R² [-]", RMSE = "RMSE [hm³]", MAE = "MAE [hm³]")
+      )
+    ) +
+    scale_color_gradient(low = "aliceblue", high = "#0072B2", name = NULL) +
+    scale_linewidth(range = c(0.3, 1.2), guide = "none") +
+    labs(x = "Radius [m]", y = NULL) +
+    theme_bw(base_size = base_size) +
+    theme(
+      legend.position = "none",
+      strip.placement = "outside",
+      strip.background = element_blank()
+    )
+  
+  p_metrics_final <- cowplot::plot_grid(p_thr, p_rad, nrow = 1, align = "hv", axis = "tb")
+  
+  print(p_metrics_final)
+  
+  ggsave(
+    filename = file.path(out_dir, "fig_metrics_orbits_blockboot.png"),
+    plot = p_metrics_final, width = 18, height = 15, units = "cm", dpi = 600
+  )
+
+save_fig_rds("fig-metric", list(
+  metrics_orbits_long = metrics_orbits_long,
+  best_orbit          = best_orbit,
+  base_size           = base_size   # optional (so laptop uses same baseline)
+))
+
+
+```
+
+```{r}
+#| fig-cap: "Aposelemis Dam storage [hm³]. Red points are reported storage observations. Black/grey points are Sentinel-1 satellite-derived storage estimates for the orbit-specific optimal (T, r) configurations. Solid lines show the 15-day smoothed satellite trajectories; shaded bands denote 95% block-bootstrap confidence intervals."
+#| label: fig-best-fit
+#| include: true
+#| cache: false
+
+# ---- settings for the figure ----
+smooth_k_fig <- smooth_k
+B_ts <- 500          # bootstrap reps for time-series CI (increase if you want)
+L_ts <- NULL         # fixed block length or NULL for auto
+ci_level <- 0.95
+
+# ---- extract orbit-specific best (T,r) ----
+# best_asc  <- best_orbit %>% dplyr::filter(orbit == "ASCENDING")  %>% dplyr::slice(1)
+# best_desc <- best_orbit %>% dplyr::filter(orbit == "DESCENDING") %>% dplyr::slice(1)
+
+# stopifnot(nrow(best_asc) == 1, nrow(best_desc) == 1)
+
+# ---- build RAW acquisition series (full dataset) for the best (T,r) in each orbit ----
+raw_asc <- df_all_joined %>%
+  dplyr::filter(
+    orbitProperties_pass == "ASCENDING",
+    Threshold_dB == best_asc$Threshold_dB,
+    Radius_m     == best_asc$Radius_m
+  ) %>%
+  dplyr::group_by(date) %>%
+  dplyr::summarise(storage = stats::median(storage, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::arrange(date) %>%
+  dplyr::mutate(orbit = "ASCENDING")
+
+raw_desc <- df_all_joined %>%
+  dplyr::filter(
+    orbitProperties_pass == "DESCENDING",
+    Threshold_dB == best_desc$Threshold_dB,
+    Radius_m     == best_desc$Radius_m
+  ) %>%
+  dplyr::group_by(date) %>%
+  dplyr::summarise(storage = stats::median(storage, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::arrange(date) %>%
+  dplyr::mutate(orbit = "DESCENDING")
+
+# ---- point-estimate DAILY trajectories ----
+daily_asc <- process_water_data_daily(raw_asc %>% dplyr::select(date, storage),
+                                      window_size = smooth_k_fig) %>%
+  dplyr::mutate(orbit = "ASCENDING")
+
+daily_desc <- process_water_data_daily(raw_desc %>% dplyr::select(date, storage),
+                                       window_size = smooth_k_fig) %>%
+  dplyr::mutate(orbit = "DESCENDING")
+
+daily_all <- dplyr::bind_rows(daily_asc, daily_desc)
+
+# ---- CI ribbons via block bootstrap of acquisition series ----
+# ci_asc <- boot_daily_ci_orbit(raw_asc %>% dplyr::select(date, storage),
+#                              smooth_k = smooth_k_fig, B = B_ts, L = L_ts, level = ci_level) %>%
+#   dplyr::mutate(orbit = "ASCENDING")
+# 
+# ci_desc <- boot_daily_ci_orbit(raw_desc %>% dplyr::select(date, storage),
+#                               smooth_k = smooth_k_fig, B = B_ts, L = L_ts, level = ci_level) %>%
+#   dplyr::mutate(orbit = "DESCENDING")
+
+
+op_ts <- future::plan()
+future::plan(multisession, workers = 2)
+
+ci_list <- future.apply::future_lapply(list(raw_asc, raw_desc), function(raw) {
+  boot_daily_ci_orbit(raw %>% dplyr::select(date, storage),
+                     smooth_k = smooth_k_fig, B = B_ts, L = L_ts, level = ci_level)
+}, future.seed = TRUE)
+
+future::plan(op_ts)
+
+ci_asc  <- ci_list[[1]] %>% mutate(orbit = "ASCENDING")
+ci_desc <- ci_list[[2]] %>% mutate(orbit = "DESCENDING")
+
+ci_all <- dplyr::bind_rows(ci_asc, ci_desc)
+raw_all <- dplyr::bind_rows(raw_asc, raw_desc)
+
+# ---- labels for legend ----
+orbit_lab <- c("ASCENDING" = "Ascending", "DESCENDING" = "Descending")
+
+# ---- single plot ----
+p_ts <- ggplot() +
+    geom_ribbon(
+      data = ci_all,
+      aes(x = date, ymin = lo, ymax = hi, fill = orbit),
+      alpha = 0.2
+    ) +
+    geom_line(
+      data = daily_all,
+      aes(x = date, y = smoothed_storage, color = orbit),
+      linewidth = 1
+    ) +
+    geom_point(
+      data = raw_all,
+      aes(x = date, y = storage, color = orbit),
+      alpha = 0.15, size = 0.8
+    ) +
+    geom_point(
+      data = obs %>% dplyr::filter(is.finite(Storage_obs)),
+      aes(x = date, y = Storage_obs),
+      color = "black", size = 1.5
+    ) +
+    scale_color_manual(
+      name = "Orbit",
+      labels = orbit_lab,
+      values = c(
+        "ASCENDING"  = "#0072B2",
+        "DESCENDING" = "#D55E00"
+      )
+    ) +
+    scale_fill_manual(
+      name = "Orbit",
+      labels = orbit_lab,
+      values = c(
+        "ASCENDING"  = "#0072B2",
+        "DESCENDING" = "#D55E00"
+      )
+    ) +
+    theme_bw() +
+    labs(x = "", y = "Storage [hm³]") +
+    theme(legend.position = "bottom",
+          legend.box.margin = margin(t = -15),
+          legend.margin = margin(t = 0, b = 0),
+          plot.margin = margin(t = 5, r = 5, b = 5, l = 5))
+  
+  print(p_ts)
+  
+  ggsave(
+    filename = file.path(out_dir, "fig_best_fit_orbits_single.png"),
+    plot = p_ts, width = 18, height = 8, units = "cm", dpi = 600
+  )
+
+# assumes you already created raw_asc/raw_desc/daily_asc/daily_desc/ci_asc/ci_desc in your fig-best-fit chunk
+save_fig_rds("fig-best-fit", list(
+  raw_asc    = raw_asc,
+  raw_desc   = raw_desc,
+  daily_asc  = daily_asc,
+  daily_desc = daily_desc,
+  ci_asc     = ci_asc,
+  ci_desc    = ci_desc,
+  obs        = obs,
+  best_orbit = best_orbit,
+  smooth_k   = smooth_k
+))
+
+
+
+```
+
+```{r}
+#| fig-cap: "Residual analysis of satellite-derived reservoir storage estimates evaluated at the optimal parameter configuration. (a) Residuals defined as ΔV  plotted against reference storage Vref [hm3]. Points represent paired satellite–reference observations, the solid line shows a linear regression fit, and the shaded band denotes the corresponding 95% confidence interval. The dashed horizontal line indicates zero error. (b) Monthly distribution of residuals [hm3] shown as boxplots, with crosses marking outliers. The dashed horizontal line indicates zero error."
+#| label: fig-error-plot
+#| include: true
+#| cache: false
+
+
+# Build paired residual dataset at observation timestamps (supported-window already applied upstream)
+comp_error <- dplyr::bind_rows(pred_best_asc, pred_best_desc) %>%
+  dplyr::filter(is.finite(smoothed_storage), is.finite(Storage_obs)) %>%
+  dplyr::mutate(
+    resid = smoothed_storage - Storage_obs,  # satellite - reference
+    month = lubridate::month(date, label = TRUE, abbr = TRUE),
+    orbit = factor(orbit, levels = c("ASCENDING","DESCENDING"),
+                   labels = c("Ascending","Descending"))
+  )
+
+comp_error <- comp_error %>%
+    dplyr::mutate(
+      month = dplyr::recode(
+        month,
+        "Ιαν" = "Jan",
+        "Φεβ" = "Feb",
+        "Μαρ" = "Mar",
+        "Απρ" = "Apr",
+        "Μαι" = "May",
+        "Ιουν" = "Jun",
+        "Ιουλ" = "Jul",
+        "Αυγ" = "Aug",
+        "Σεπ" = "Sep",
+        "Οκτ" = "Oct",
+        "Νοε" = "Nov",
+        "Δεκ" = "Dec"
+      )
+    )
+  
+  orbit_cols <- c(
+    "Ascending"  = "#0072B2",
+    "Descending" = "#D55E00"
+  )
+  
+  y_limits <- range(comp_error$resid, na.rm = TRUE)
+  
+  p1 <- ggplot(comp_error, aes(x = Storage_obs, y = resid, color = orbit)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    geom_point() +
+    
+    geom_smooth(
+      method = "lm",
+      se = TRUE,
+      aes(fill = orbit),
+      alpha = 0.25,
+      color = NA
+    ) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 0.6) +
+    # Apply palette to BOTH aesthetics
+    scale_color_manual(values = orbit_cols, labels = orbit_lab, name = "Orbit") +
+    scale_fill_manual(values  = orbit_cols, labels = orbit_lab, name = "Orbit") +
+    labs(
+      x = expression("Reference storage"~"["*h*m^3*"]"),
+      y = expression("Residual ("*V[sat]*"-"*V[ref]*")"~"["*h*m^3*"]"),
+      color = "Orbit",
+      fill  = "Orbit"
+    ) +
+    theme_bw() +
+    coord_cartesian(ylim = y_limits)
+  
+
+  p2 <- ggplot(comp_error, aes(x = month, y = resid, color = orbit)) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+
+    geom_boxplot(outlier.shape = 4, position = position_dodge(width = 0.75),
+                 linewidth = 0.6) +
+    labs(x = "Month", y = NULL) +
+    theme_bw() +
+    scale_color_manual(
+      values = orbit_cols,
+      name = "Orbit"
+    ) +
+    scale_x_discrete(
+      labels = function(x) ifelse(seq_along(x) %% 2 == 1, x, "")
+    ) +
+    coord_cartesian(ylim = y_limits)
+  
+  p <- ggarrange(
+    p1, p2,
+    nrow = 1, ncol = 2,
+    align = "hv",
+    labels = c("a", "b"),
+    common.legend = TRUE,
+    legend = "bottom"
+  )
+  
+  print(p)
+  
+   
+  ggsave(
+    filename = file.path(out_dir, "fig_error_plot.png"),
+    plot = p, width = 18, height = 8, units = "cm", dpi = 1200
+  )
+
+# comp_error is built in your fig-error-plot chunk
+save_fig_rds("fig-error-plot", list(
+  comp_error = comp_error,
+  base_size  = base_size
+))
+
+```
+
+# Stability accessment
+
+```{r}
+#| label: stability
+#| include: true
+#| cache: false
+
+# -----------------------------------------
+# 1) Build the paired best-fit table per orbit
+#    (using the already-aligned comp_orbits)
+# -----------------------------------------
+get_best_pairs <- function(comp_orbits, best_orbit, orbit_name) {
+  best <- best_orbit %>% dplyr::filter(orbit == orbit_name) %>% dplyr::slice(1)
+
+  comp_orbits %>%
+    dplyr::filter(
+      orbit == orbit_name,
+      Threshold_dB == best$Threshold_dB,
+      Radius_m     == best$Radius_m
+    ) %>%
+    dplyr::arrange(date) %>%
+    dplyr::select(date, Storage_obs, smoothed_storage)
+}
+
+# -----------------------------------------
+# 2) Block-subset indices (contiguous blocks, sampled with replacement)
+# -----------------------------------------
+block_subset_idx <- function(n, L, m) {
+  # n = total length, L = block length, m = desired subset size
+  stopifnot(n >= 3, L >= 1, m >= 3, m <= n)
+
+  idx <- integer(0)
+  while (length(idx) < m) {
+    s <- sample.int(n, 1)
+    blk <- ((s - 1) + seq_len(L) - 1) %% n + 1
+    idx <- c(idx, blk)
+  }
+  idx[seq_len(m)]
+}
+
+# -----------------------------------------
+# 3) For a given orbit: learning curve of metric stability vs n
+# -----------------------------------------
+min_n_stability <- function(df_pairs,
+                            n_grid = seq(10, nrow(df_pairs), by = 5),
+                            R = 500,
+                            accept = list(
+                              KGE_min = 0.90,
+                              R2_min  = 0.90,
+                              RMSE_max = Inf,     # set if you want, e.g. 3
+                              prob = 0.80         # require 80% of resamples "acceptable"
+                            )) {
+
+  stopifnot(all(c("Storage_obs","smoothed_storage") %in% names(df_pairs)))
+  df_pairs <- df_pairs %>% dplyr::filter(is.finite(Storage_obs), is.finite(smoothed_storage)) %>% dplyr::arrange(date)
+  n0 <- nrow(df_pairs)
+  if (n0 < 10) stop("Too few paired points.")
+
+  # pick a block length from residual autocorrelation (same idea you already use)
+  res <- df_pairs$smoothed_storage - df_pairs$Storage_obs
+  L_info <- choose_block_length(res)
+  L <- L_info$L
+
+  out <- lapply(n_grid, function(m) {
+    mets <- replicate(R, {
+      ib <- block_subset_idx(n0, L, m)
+      metric_vec(df_pairs$Storage_obs[ib], df_pairs$smoothed_storage[ib])
+    })
+    mets <- t(mets) %>% as.data.frame()
+
+    ok <- with(mets,
+               (KGE >= accept$KGE_min) &
+               (R2  >= accept$R2_min)  &
+               (RMSE <= accept$RMSE_max))
+
+    dplyr::tibble(
+      n = m,
+      block_L = L,
+      ok_prob = mean(ok, na.rm = TRUE),
+      KGE_med = median(mets$KGE, na.rm = TRUE),
+      R2_med  = median(mets$R2,  na.rm = TRUE),
+      RMSE_med= median(mets$RMSE,na.rm = TRUE),
+      KGE_q05 = quantile(mets$KGE, 0.05, na.rm = TRUE),
+      KGE_q95 = quantile(mets$KGE, 0.95, na.rm = TRUE),
+      R2_q05  = quantile(mets$R2,  0.05, na.rm = TRUE),
+      R2_q95  = quantile(mets$R2,  0.95, na.rm = TRUE)
+    )
+  }) %>% dplyr::bind_rows()
+
+  n_min <- out %>%
+    dplyr::filter(ok_prob >= accept$prob) %>%
+    dplyr::summarise(n_min = min(n, na.rm = TRUE)) %>%
+    dplyr::pull(n_min)
+
+  list(summary = out, n_min = n_min)
+}
+
+# -----------------------------------------
+# 4) Run for each orbit
+# -----------------------------------------
+pairs_asc  <- get_best_pairs(comp_orbits, best_orbit, "ASCENDING")
+pairs_desc <- get_best_pairs(comp_orbits, best_orbit, "DESCENDING")
+
+# Define what "acceptable" means (tune these)
+accept_rules <- list(KGE_min = 0.95, R2_min = 0.90, RMSE_max = 3.0, prob = 0.80)
+
+res_asc  <- min_n_stability(pairs_asc,  n_grid = seq(10, nrow(pairs_asc),  by = 5), R = 500, accept = accept_rules)
+res_desc <- min_n_stability(pairs_desc, n_grid = seq(10, nrow(pairs_desc), by = 5), R = 500, accept = accept_rules)
+
+res_asc$n_min
+res_desc$n_min
+
+# Inspect the full curve (good for a figure/table)
+res_asc$summary
+res_desc$summary
+
+
+```
+
+
+```{r}
+#| label: naive-parameters
+#| include: true
+#| cache: false
+
+naive_metrics <- function(comp_orbits, T_naive = -18, r_naive = 100) {
+
+  comp_orbits %>%
+    dplyr::filter(Threshold_dB == T_naive, Radius_m == r_naive) %>%
+    dplyr::group_by(orbit) %>%
+    dplyr::summarise(
+      n = dplyr::n(),
+      RMSE = rmse(Storage_obs, smoothed_storage),
+      MAE  = mae(Storage_obs, smoothed_storage),
+      R2   = r2(Storage_obs, smoothed_storage),
+      KGE  = kge(Storage_obs, smoothed_storage),
+      .groups = "drop"
+    )
+}
+
+naive_tbl <- naive_metrics(comp_orbits, T_naive = -18, r_naive = 100)
+naive_tbl
+```
+
+```{r}
+#| fig-cap: "Stability curve"
+#| label: fig-stability
+#| include: true
+#| cache: false
+
+# --- subset indices via circular blocks (preserves temporal dependence) ---
+block_subset_idx <- function(n, L, m) {
+  stopifnot(n >= 3, L >= 1, m >= 3, m <= n)
+  idx <- integer(0)
+  while (length(idx) < m) {
+    s <- sample.int(n, 1)
+    blk <- ((s - 1) + seq_len(L) - 1) %% n + 1
+    idx <- c(idx, blk)
+  }
+  idx[seq_len(m)]
+}
+
+# --- extract paired series at the BEST (T,r) for an orbit ---
+get_best_pairs <- function(comp_orbits, best_orbit, orbit_name) {
+  best <- best_orbit %>% dplyr::filter(orbit == orbit_name) %>% dplyr::slice(1)
+
+  comp_orbits %>%
+    dplyr::filter(
+      orbit == orbit_name,
+      Threshold_dB == best$Threshold_dB,
+      Radius_m     == best$Radius_m
+    ) %>%
+    dplyr::arrange(date) %>%
+    dplyr::select(date, Storage_obs, smoothed_storage)
+}
+
+# --- compute stability curve for one orbit ---
+stability_curve <- function(df_pairs,
+                            orbit_label,
+                            m_grid = NULL,
+                            R = 500) {
+
+  df_pairs <- df_pairs %>%
+    dplyr::filter(is.finite(Storage_obs), is.finite(smoothed_storage)) %>%
+    dplyr::arrange(date)
+
+  n0 <- nrow(df_pairs)
+  if (is.null(m_grid)) {
+    m_grid <- unique(pmin(n0, seq(10, n0, by = 5)))
+    m_grid <- m_grid[m_grid >= 6]
+  }
+
+  # block length from residual AR(1)
+  res <- df_pairs$smoothed_storage - df_pairs$Storage_obs
+  L_info <- choose_block_length(res)
+  L <- L_info$L
+
+  out <- lapply(m_grid, function(m) {
+    mets <- replicate(R, {
+      ib <- block_subset_idx(n0, L, m)
+      metric_vec(df_pairs$Storage_obs[ib], df_pairs$smoothed_storage[ib])
+    })
+    mets <- as.data.frame(t(mets))
+
+    dplyr::tibble(
+      orbit = orbit_label,
+      m = m,
+      block_L = L,
+
+      # --- KGE ---
+      KGE_med = median(mets$KGE, na.rm = TRUE),
+      KGE_q05 = quantile(mets$KGE, 0.05, na.rm = TRUE),
+      KGE_q95 = quantile(mets$KGE, 0.95, na.rm = TRUE),
+
+      # --- R2 ---
+      R2_med  = median(mets$R2,  na.rm = TRUE),
+      R2_q05  = quantile(mets$R2, 0.05, na.rm = TRUE),
+      R2_q95  = quantile(mets$R2, 0.95, na.rm = TRUE),
+
+      # --- RMSE ---
+      RMSE_med = median(mets$RMSE, na.rm = TRUE),
+      RMSE_q05 = quantile(mets$RMSE, 0.05, na.rm = TRUE),
+      RMSE_q95 = quantile(mets$RMSE, 0.95, na.rm = TRUE),
+
+      # --- MAE (NEW) ---
+      MAE_med = median(mets$MAE, na.rm = TRUE),
+      MAE_q05 = quantile(mets$MAE, 0.05, na.rm = TRUE),
+      MAE_q95 = quantile(mets$MAE, 0.95, na.rm = TRUE)
+    )
+  }) %>% dplyr::bind_rows()
+
+  out
+}
+
+```
+
+
+```{r}
+#| fig-cap: "Stability bands"
+#| label: fig-stability-bands
+#| include: true
+#| cache: false
+
+pairs_asc  <- get_best_pairs(comp_orbits, best_orbit, "ASCENDING")
+pairs_desc <- get_best_pairs(comp_orbits, best_orbit, "DESCENDING")
+
+stab_asc  <- stability_curve(pairs_asc,  orbit_label = "Ascending",  R = 500)
+stab_desc <- stability_curve(pairs_desc, orbit_label = "Descending", R = 500)
+
+stab <- dplyr::bind_rows(stab_asc, stab_desc)
+
+# --- long format for faceting ---
+stab_long <- stab %>%
+  dplyr::select(
+    orbit, m,
+    KGE_med, KGE_q05, KGE_q95,
+    R2_med,  R2_q05,  R2_q95,
+    RMSE_med, RMSE_q05, RMSE_q95,
+    MAE_med,  MAE_q05,  MAE_q95
+  ) %>%
+  tidyr::pivot_longer(
+    cols = -c(orbit, m),
+    names_to = c("Metric", "stat"),
+    names_pattern = "(KGE|R2|RMSE|MAE)_(med|q05|q95)"
+  ) %>%
+  tidyr::pivot_wider(names_from = stat, values_from = value) %>%
+  dplyr::mutate(
+    Metric = factor(
+      Metric,
+      levels = c("KGE", "R2", "RMSE", "MAE"),
+      labels = c("KGE [-]", "R² [-]", "RMSE [hm³]", "MAE [hm³]")
+    )
+  )
+
+# --- optional acceptability thresholds ---
+acc_kge <- 0.90
+acc_r2  <- 0.90
+
+p_stab <- ggplot(stab_long, aes(x = m, y = med, color = orbit, fill = orbit)) +
+  geom_ribbon(aes(ymin = q05, ymax = q95), alpha = 0.20, color = NA) +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~Metric, scales = "free_y", ncol = 2) +
+  scale_fill_manual(
+      name = "Orbit",
+      labels = orbit_lab,
+      values = c(
+        "ASCENDING"  = "#0072B2",
+        "DESCENDING" = "#D55E00"
+      )
+    ) +
+  labs(
+    x = "Number of paired validation points m",
+    y = NULL
+  ) +
+  theme_bw(base_size = base_size) +
+  theme(legend.position = "bottom")
+
+print(p_stab)
+
+save_fig_rds("fig-stability", list(
+  # raw stability summaries (wide)
+  stab = stab,
+
+  # plotting long-format table
+  stab_long = stab_long,
+
+  # thresholds used in the figure (if any)
+  acc_kge = acc_kge,
+  acc_r2  = acc_r2,
+
+  # plot settings
+  base_size = base_size,
+
+  # metadata (nice to keep)
+  R = 500
+))
+
+ggsave(
+  filename = file.path(out_dir, "fig_stability_curve.png"),
+  plot = p_stab, width = 10, height = 14, units = "cm", dpi = 600
+)
+
+```
